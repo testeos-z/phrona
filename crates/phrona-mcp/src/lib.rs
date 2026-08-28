@@ -1,18 +1,21 @@
 //! Phrona MCP server.
 //!
-//! Exposes the phrona library to AI agents over stdio (JSON-RPC).
-//! Tools are compartmentalized per capability: per-category search,
-//! suggestions, page extraction and grounded search for RAG.
+//! Exposes the phrona library to AI agents over stdio (JSON-RPC) and
+//! Streamable HTTP. Tools are compartmentalized per capability:
+//! per-category search, suggestions, page extraction and grounded search
+//! for RAG.
 
 #![warn(missing_docs)]
-
-use std::time::Duration;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::tool_router;
 use rmcp::transport::stdio;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
 use rmcp::{ServiceExt, tool};
 use schemars::JsonSchema;
+use tokio_util::sync::CancellationToken;
 
 use phrona::models::{Category, TimeRange};
 use phrona::{PhronaConfig, ResultItem, SearchClient, SearchOptions};
@@ -166,11 +169,9 @@ impl PhronaMcp {
     }
 }
 
-/// Serialize a tool result as a single-line JSON string. MCP stdio clients
-/// parse tool outputs as JSON, so every handler must return valid JSON —
-/// never an empty string or a debug-formatted value. A serialization
-/// failure (theoretically unreachable for `serde_json::Value`) degrades to
-/// a fixed JSON envelope.
+/// Serialize a tool result as a single-line JSON string. MCP clients parse
+/// tool outputs as JSON, so every handler must return valid JSON — never an
+/// empty string or a debug-formatted value.
 fn envelope(v: serde_json::Value) -> String {
     serde_json::to_string(&v)
         .unwrap_or_else(|_| r#"{"error":"internal serialization failure"}"#.to_string())
@@ -274,8 +275,6 @@ impl PhronaMcp {
     )]
     fn list_engines(&self, Parameters(p): Parameters<EnginesParams>) -> String {
         let cats: Vec<Category> = match p.category.as_deref() {
-            // invalid categories are a loud error (matching the REST API),
-            // not an empty result that looks like success
             Some(c) => match c.parse::<Category>() {
                 Ok(c) => vec![c],
                 Err(_) => {
@@ -371,44 +370,45 @@ pub async fn run_stdio(cfg: &PhronaConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Serve the MCP server over a TCP listener (newline-delimited JSON-RPC,
-/// the same framing as stdio). Each connection is served in its own task.
-/// `shutdown` fires on SIGTERM/Ctrl+C: the accept loop stops and in-flight
-/// connections get a short grace window to drain before the process exits.
-/// Blocks until the listener is closed or shutdown fires.
+/// Serve MCP over the standard Streamable HTTP transport.
+///
+/// The supplied listener determines the bind address. The MCP endpoint is
+/// mounted at `/mcp`, uses the official `rmcp` Streamable HTTP transport and
+/// keeps sessions in memory with [`LocalSessionManager`].
+///
+/// `shutdown` fires on SIGTERM/Ctrl+C and gracefully stops the HTTP server.
 pub async fn serve_tcp(
     listener: tokio::net::TcpListener,
     cfg: PhronaConfig,
     shutdown: std::sync::Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<()> {
-    tracing::info!("phrona-mcp listening on {}", listener.local_addr()?);
-    let mut conns: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    loop {
-        tokio::select! {
-            _ = shutdown.notified() => break,
-            accepted = listener.accept() => {
-                let (socket, _) = accepted?;
-                let cfg = cfg.clone();
-                conns.spawn(async move {
-                    let service = PhronaMcp::with_config(&cfg);
-                    match service.serve(socket).await {
-                        Ok(server) => {
-                            let _ = server.waiting().await;
-                        }
-                        Err(e) => tracing::debug!("mcp connection failed: {e}"),
-                    }
-                });
-            }
-        }
-    }
-    // Grace window for in-flight requests; the rest are aborted with the
-    // process when the runtime shuts down.
-    let drain = tokio::time::timeout(Duration::from_secs(2), conns.join_all());
-    let _ = drain.await;
+    let addr = listener.local_addr()?;
+    let cancellation = CancellationToken::new();
+    let transport_cancellation = cancellation.child_token();
+    let shutdown_cancellation = cancellation.clone();
+    let service_cfg = cfg.clone();
+
+    let service = StreamableHttpService::new(
+        move || Ok(PhronaMcp::with_config(&service_cfg)),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default()
+            .with_cancellation_token(transport_cancellation),
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    tracing::info!("phrona-mcp Streamable HTTP listening on http://{addr}/mcp");
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            shutdown.notified().await;
+            shutdown_cancellation.cancel();
+        })
+        .await?;
     Ok(())
 }
 
-/// Build a TCP listener from an addr string (e.g. "127.0.0.1:8081").
+/// Build a TCP listener from an addr string (for example `0.0.0.0:8081`).
+/// The listener is used by the Streamable HTTP MCP server.
 pub async fn tcp_listener(addr: &str) -> anyhow::Result<tokio::net::TcpListener> {
     Ok(tokio::net::TcpListener::bind(addr).await?)
 }
