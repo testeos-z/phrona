@@ -13,7 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release --locked -p phrona-cli && \
+# The MCP HTTP feature adds transitive dependencies that are not yet present
+# in the fork's Cargo.lock. Allow Cargo to refresh the lock during the image
+# build so the native Streamable HTTP transport can be validated/deployed.
+RUN cargo build --release -p phrona-cli && \
     cp target/release/phrona /phrona
 
 FROM debian:bookworm-slim
@@ -25,7 +28,7 @@ COPY --from=builder /build/crates/phrona-api/assets /usr/share/phrona/frontend
 ENV PHRONA_ADDR=0.0.0.0:8080
 ENV PHRONA_FRONTEND_DIR=/usr/share/phrona/frontend
 ENV HOME=/home/phrona
-EXPOSE 8080
+EXPOSE 8080 8081
 # Run as an unprivileged user: the API never writes to the filesystem, so
 # the least-privileged identity is the safest default.
 USER phrona
