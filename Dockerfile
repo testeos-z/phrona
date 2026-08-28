@@ -1,5 +1,16 @@
 # Multi-stage build: Rust release binary + frontend assets.
 FROM rust:1.97-bookworm AS builder
+
+# btls-sys builds BoringSSL from source and requires a native C/C++ toolchain
+# plus CMake. Keep these dependencies in the builder stage only so the final
+# runtime image remains small.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    clang \
+    cmake \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 COPY . .
 RUN cargo build --release --locked -p phrona-cli && \
