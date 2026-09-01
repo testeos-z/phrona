@@ -3,6 +3,7 @@ dist/
 build/
 *.egg-info/
 .venv/
+.atl/
 
 # local session cache (operator machine only)
 phrona.cookies.json
