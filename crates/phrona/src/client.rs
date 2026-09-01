@@ -1,6 +1,10 @@
 //! HTTP client with browser impersonation, proxy pool and SSRF guards.
 
+#[cfg(test)]
+use std::collections::HashMap;
 use std::net::IpAddr;
+#[cfg(test)]
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -327,6 +331,8 @@ impl ProxyPool {
 pub struct HttpClient {
     client: wreq::Client,
     target_policy: TargetPolicy,
+    #[cfg(test)]
+    test_resolutions: HashMap<String, (SocketAddr, IpAddr)>,
 }
 
 impl HttpClient {
@@ -339,6 +345,13 @@ impl HttpClient {
     /// The domain allow/deny policy applied to outbound targets.
     pub(crate) fn target_policy(&self) -> &TargetPolicy {
         &self.target_policy
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_safe_ip(&self, host: &str) -> Option<IpAddr> {
+        self.test_resolutions
+            .get(&host.to_ascii_lowercase())
+            .map(|(_, safe_ip)| *safe_ip)
     }
 
     /// Perform a GET request. Redirects are followed up to the configured
@@ -419,6 +432,8 @@ pub struct HttpClientBuilder {
     headers: HeaderMap,
     proxy: Option<String>,
     target_policy: TargetPolicy,
+    #[cfg(test)]
+    test_resolutions: HashMap<String, (SocketAddr, IpAddr)>,
 }
 
 impl Default for HttpClientBuilder {
@@ -437,6 +452,8 @@ impl Default for HttpClientBuilder {
             headers,
             proxy: None,
             target_policy: TargetPolicy::default(),
+            #[cfg(test)]
+            test_resolutions: HashMap::new(),
         }
     }
 }
@@ -474,10 +491,26 @@ impl HttpClientBuilder {
         self
     }
 
+    /// Route one hostname to a loopback listener while reporting a safe
+    /// public address to the test-only extraction preflight.
+    #[cfg(test)]
+    pub(crate) fn resolve_for_test(
+        mut self,
+        host: impl Into<String>,
+        connect_addr: SocketAddr,
+        safe_addr: IpAddr,
+    ) -> Self {
+        self.test_resolutions
+            .insert(host.into().to_ascii_lowercase(), (connect_addr, safe_addr));
+        self
+    }
+
     /// Build the client. Returns an [`Error::invalid_query`] for an invalid
     /// proxy URL and an internal error if the underlying client cannot be
     /// constructed.
     pub fn build(self) -> Result<HttpClient> {
+        #[cfg(test)]
+        let test_resolutions = self.test_resolutions.clone();
         let mut builder = wreq::Client::builder()
             .emulation(self.profile.to_emulation())
             .timeout(self.timeout)
@@ -485,6 +518,16 @@ impl HttpClientBuilder {
                 self.redirects,
                 self.target_policy.clone(),
             ));
+        #[cfg(test)]
+        {
+            // Test fixtures must reach their loopback spy directly even when
+            // the process inherits HTTP(S)_PROXY/ALL_PROXY from the host.
+            builder = builder.no_proxy();
+        }
+        #[cfg(test)]
+        for (host, (connect_addr, _)) in &test_resolutions {
+            builder = builder.resolve(host.clone(), *connect_addr);
+        }
         if self.cookies {
             builder = builder.cookie_store(true);
         }
@@ -502,6 +545,8 @@ impl HttpClientBuilder {
         Ok(HttpClient {
             client,
             target_policy: self.target_policy,
+            #[cfg(test)]
+            test_resolutions,
         })
     }
 }
@@ -509,7 +554,9 @@ impl HttpClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SearchClient;
     use crate::error::ErrorKind;
+    use crate::source_policy::SourceCatalogue;
     use futures::FutureExt;
 
     #[test]
@@ -625,5 +672,20 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn source_catalogue_can_be_attached_to_an_explicit_client() {
+        let catalogue =
+            SourceCatalogue::compile(["official.example"], std::iter::empty::<&str>()).unwrap();
+        let client = SearchClient::with_options(
+            Profile::Chrome,
+            Some(Duration::from_secs(1)),
+            None,
+            TargetPolicy::default(),
+        )
+        .unwrap()
+        .with_source_catalogue(catalogue.clone());
+        assert_eq!(client.source_catalogue(), &catalogue);
     }
 }

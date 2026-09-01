@@ -117,6 +117,18 @@ pub struct SearchArgs {
     /// Result page
     #[arg(long, default_value_t = 1)]
     pub page: u32,
+
+    /// Source policy mode: any | prefer-official | require-allowed | official-only
+    #[arg(long = "source-policy-mode", default_value = "any", value_parser = source_policy_mode_parser)]
+    pub source_policy_mode: String,
+
+    /// Caller-requested hostname; repeat for multiple domains.
+    #[arg(long = "allowed-domain")]
+    pub allowed_domains: Vec<String>,
+
+    /// Caller-excluded hostname; repeat for multiple domains.
+    #[arg(long = "excluded-domain")]
+    pub excluded_domains: Vec<String>,
 }
 
 /// Arguments for `phrona suggest`: query autocomplete from search sources.
@@ -148,6 +160,16 @@ pub struct ExtractArgs {
     /// Bias the excerpt toward this query
     #[arg(long)]
     pub query: Option<String>,
+
+    /// Source policy mode for the initial URL and redirects.
+    #[arg(long = "source-policy-mode", default_value = "any", value_parser = source_policy_mode_parser)]
+    pub source_policy_mode: String,
+    /// Caller-requested hostname; repeat for multiple domains.
+    #[arg(long = "allowed-domain")]
+    pub allowed_domains: Vec<String>,
+    /// Caller-excluded hostname; repeat for multiple domains.
+    #[arg(long = "excluded-domain")]
+    pub excluded_domains: Vec<String>,
 }
 
 /// Arguments for `phrona ground`: grounded search with a synthesized
@@ -192,6 +214,16 @@ pub struct GroundArgs {
     /// Result page
     #[arg(long, default_value_t = 1)]
     pub page: u32,
+
+    /// Source policy mode: any | prefer-official | require-allowed | official-only
+    #[arg(long = "source-policy-mode", default_value = "any", value_parser = source_policy_mode_parser)]
+    pub source_policy_mode: String,
+    /// Caller-requested hostname; repeat for multiple domains.
+    #[arg(long = "allowed-domain")]
+    pub allowed_domains: Vec<String>,
+    /// Caller-excluded hostname; repeat for multiple domains.
+    #[arg(long = "excluded-domain")]
+    pub excluded_domains: Vec<String>,
 }
 
 /// Arguments for `phrona engines`: list engines for a category.
@@ -276,6 +308,12 @@ fn time_range_parser(s: &str) -> Result<TimeRange, String> {
         .map_err(|_| "invalid time_range, expected one of: day, week, month, year".to_string())
 }
 
+fn source_policy_mode_parser(s: &str) -> Result<String, String> {
+    s.parse::<phrona::SourceMode>()
+        .map(|mode| mode.to_string())
+        .map_err(|e| e.to_string())
+}
+
 fn profile_parser(s: &str) -> Result<Profile, String> {
     Profile::from_name(s).ok_or_else(|| {
         format!(
@@ -341,5 +379,27 @@ mod tests {
         assert!(time_range_parser("yesterday").is_err());
         assert!(safesearch_parser("strict").is_ok());
         assert!(safesearch_parser("x").is_err());
+    }
+
+    #[test]
+    fn search_accepts_source_policy_flags() {
+        let cli = Cli::try_parse_from([
+            "phrona",
+            "search",
+            "rust",
+            "--source-policy-mode",
+            "official-only",
+            "--allowed-domain",
+            "docs.example",
+            "--excluded-domain",
+            "ads.example",
+        ])
+        .unwrap();
+        let Command::Search(args) = cli.command else {
+            panic!("expected search")
+        };
+        assert_eq!(args.source_policy_mode, "official-only");
+        assert_eq!(args.allowed_domains, ["docs.example"]);
+        assert_eq!(args.excluded_domains, ["ads.example"]);
     }
 }

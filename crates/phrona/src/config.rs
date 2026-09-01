@@ -22,6 +22,7 @@ use crate::client::Profile;
 use crate::error::Result;
 use crate::options::SearchOptions;
 use crate::search::SearchClient;
+use crate::source_policy::{SourceCatalogue, SourcePolicyError};
 
 /// Name of the default config file looked up in the working directory.
 pub const DEFAULT_CONFIG_FILE: &str = "phrona.yaml";
@@ -62,6 +63,8 @@ pub enum ConfigError {
     Env(String),
     /// A bind address is not a valid `SocketAddr`.
     InvalidAddr(String),
+    /// The operator source catalogue contains an invalid domain.
+    InvalidSourceCatalogue(SourcePolicyError),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -74,6 +77,9 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::Env(e) => write!(f, "config: {e}"),
             ConfigError::InvalidAddr(a) => write!(f, "config: invalid bind address: {a}"),
+            ConfigError::InvalidSourceCatalogue(e) => {
+                write!(f, "config: invalid source catalogue: {e}")
+            }
         }
     }
 }
@@ -262,6 +268,18 @@ impl Default for EnginesConfig {
     }
 }
 
+/// Operator-owned source authority lists. These are never supplied by a
+/// caller request and are compiled before a client is constructed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SourcesConfig {
+    /// Official source domains.
+    #[serde(default)]
+    pub official: Vec<String>,
+    /// Reputable secondary source domains.
+    #[serde(default)]
+    pub secondary: Vec<String>,
+}
+
 /// Typed YAML configuration for all Phrona surfaces.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PhronaConfig {
@@ -277,6 +295,9 @@ pub struct PhronaConfig {
     /// Engine transport (proxy pool, impersonation profile).
     #[serde(default)]
     pub engines: EnginesConfig,
+    /// Operator-managed source authority catalogue.
+    #[serde(default)]
+    pub sources: SourcesConfig,
 }
 
 impl PhronaConfig {
@@ -465,6 +486,13 @@ impl PhronaConfig {
     pub fn bootstrap_cookies(&self) -> &HashMap<String, String> {
         &self.engines.bootstrap_cookies
     }
+
+    /// Compile the operator-owned source catalogue, rejecting invalid
+    /// hostname-only entries before any search client is created.
+    pub fn source_catalogue(&self) -> std::result::Result<SourceCatalogue, ConfigError> {
+        SourceCatalogue::compile(&self.sources.official, &self.sources.secondary)
+            .map_err(ConfigError::InvalidSourceCatalogue)
+    }
 }
 
 fn parse_bool(s: &str) -> std::result::Result<bool, String> {
@@ -486,6 +514,7 @@ fn split_csv(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source_policy::SourceTier;
 
     #[test]
     fn defaults_are_sane() {
@@ -520,6 +549,29 @@ mod tests {
         assert_eq!(cfg.search.timeout_secs, 15);
         assert!(cfg.security.block_private_ips);
         assert_eq!(cfg.engines.profile, "chrome");
+        assert!(cfg.sources.official.is_empty());
+        assert!(cfg.sources.secondary.is_empty());
+    }
+
+    #[test]
+    fn source_catalogue_is_operator_owned_and_validated() {
+        let cfg = PhronaConfig::from_yaml_str(
+            "sources:\n  official: [docs.example.com]\n  secondary: [community.example.com]\n",
+        )
+        .unwrap();
+        let catalogue = cfg.source_catalogue().unwrap();
+        assert_eq!(
+            catalogue.classify_host("docs.example.com"),
+            SourceTier::Official
+        );
+        assert_eq!(
+            catalogue.classify_host("community.example.com"),
+            SourceTier::Secondary
+        );
+
+        let invalid =
+            PhronaConfig::from_yaml_str("sources:\n  official: [https://example.com]\n").unwrap();
+        assert!(invalid.source_catalogue().is_err());
     }
 
     #[test]

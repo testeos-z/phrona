@@ -22,6 +22,12 @@ pub struct ExtractGetParams {
     max_chars: Option<usize>,
     #[serde(default)]
     query: Option<String>,
+    #[serde(default)]
+    source_policy_mode: Option<String>,
+    #[serde(default)]
+    allowed_domains: Option<String>,
+    #[serde(default)]
+    excluded_domains: Option<String>,
 }
 
 /// POST /v1/extract - same feature, credentials via headers or body.
@@ -34,6 +40,12 @@ pub struct ExtractPostParams {
     query: Option<String>,
     #[serde(default)]
     api_key: Option<String>,
+    #[serde(default)]
+    source_policy_mode: Option<String>,
+    #[serde(default)]
+    allowed_domains: Option<Vec<String>>,
+    #[serde(default)]
+    excluded_domains: Option<Vec<String>>,
 }
 
 /// GET /v1/test?query=...&category=...&max_results=... - availability probe
@@ -58,7 +70,16 @@ pub async fn extract_get(
     if !state.authorized(auth.key()) {
         return Err(AppError::unauthorized());
     }
-    run_extract(&state, &p.url, p.max_chars, p.query.as_deref()).await
+    run_extract(
+        &state,
+        &p.url,
+        p.max_chars,
+        p.query.as_deref(),
+        p.source_policy_mode.as_deref(),
+        crate::split_domains(p.allowed_domains.as_deref()),
+        crate::split_domains(p.excluded_domains.as_deref()),
+    )
+    .await
 }
 
 /// `POST /v1/extract`: body variant of the page extraction endpoint.
@@ -70,7 +91,16 @@ pub async fn extract_post(
     if !state.authorized(crate::auth_key(&headers, p.api_key.as_deref()).as_deref()) {
         return Err(AppError::unauthorized());
     }
-    run_extract(&state, &p.url, p.max_chars, p.query.as_deref()).await
+    run_extract(
+        &state,
+        &p.url,
+        p.max_chars,
+        p.query.as_deref(),
+        p.source_policy_mode.as_deref(),
+        p.allowed_domains.clone().unwrap_or_default(),
+        p.excluded_domains.clone().unwrap_or_default(),
+    )
+    .await
 }
 
 async fn run_extract(
@@ -78,9 +108,22 @@ async fn run_extract(
     url: &str,
     max_chars: Option<usize>,
     query: Option<&str>,
+    source_policy_mode: Option<&str>,
+    allowed_domains: Vec<String>,
+    excluded_domains: Vec<String>,
 ) -> AppResult<Json<phrona::ExtractedPage>> {
     let max_chars = max_chars.unwrap_or(5000).clamp(1, 100_000);
-    let page = phrona::extract(state.client.http(), url, max_chars, query).await?;
+    let policy =
+        crate::compile_source_policy(source_policy_mode, allowed_domains, excluded_domains)?;
+    let page = phrona::extract_with_policy(
+        state.client.http(),
+        &policy,
+        state.client.source_catalogue(),
+        url,
+        max_chars,
+        query,
+    )
+    .await?;
     Ok(Json(page))
 }
 

@@ -28,6 +28,7 @@ fn load_config() -> PhronaConfig {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = load_config();
+    let source_catalogue = cfg.source_catalogue()?;
     let profile = cli.profile.unwrap_or_else(|| cfg.profile());
     let timeout = Duration::from_secs(cli.timeout.unwrap_or(cfg.search.timeout_secs));
     let proxies = if cli.proxy.is_empty() {
@@ -39,8 +40,9 @@ async fn main() -> Result<()> {
         profile,
         Some(timeout),
         (!proxies.is_empty()).then_some(proxies),
-        phrona::TargetPolicy::default(),
+        phrona::TargetPolicy::from_security(&cfg.security),
     )?
+    .with_source_catalogue(source_catalogue)
     .with_auto_bootstrap(cli.auto_bootstrap || cfg.engines.auto_bootstrap);
     // config-provided bootstrap cookies first, then --cookie overrides
     for (engine, cookies) in cfg.bootstrap_cookies() {
@@ -69,6 +71,11 @@ async fn main() -> Result<()> {
             opts.time_range = args.time_range;
             opts.filters = args.filters.clone();
             opts.page = args.page.max(1);
+            opts.source_policy = source_policy(
+                &args.source_policy_mode,
+                &args.allowed_domains,
+                &args.excluded_domains,
+            )?;
             let resp = client.search(opts).await?;
             if cli.json {
                 print_json(&resp);
@@ -104,8 +111,15 @@ async fn main() -> Result<()> {
             }
         }
         Command::Extract(args) => {
-            let results = phrona::extract_many(
+            let policy = source_policy(
+                &args.source_policy_mode,
+                &args.allowed_domains,
+                &args.excluded_domains,
+            )?;
+            let results = phrona::extract_many_with_policy(
                 client.http(),
+                &policy,
+                client.source_catalogue(),
                 &args.urls,
                 args.max_chars,
                 args.query.as_deref(),
@@ -153,6 +167,11 @@ async fn main() -> Result<()> {
             opts.safesearch = args.safesearch;
             opts.filters = args.filters.clone();
             opts.page = args.page.max(1);
+            opts.source_policy = source_policy(
+                &args.source_policy_mode,
+                &args.allowed_domains,
+                &args.excluded_domains,
+            )?;
             let resp = client.search(opts).await?;
             if cli.json {
                 print_json(&resp);
@@ -339,6 +358,15 @@ async fn run_bootstrap(client: &phrona::SearchClient, args: &BootstrapArgs) -> a
 fn split_engines(s: Option<&str>) -> Vec<String> {
     s.map(|s| s.split(',').map(|e| e.trim().to_string()).collect())
         .unwrap_or_default()
+}
+
+fn source_policy(
+    mode: &str,
+    allowed: &[String],
+    denied: &[String],
+) -> anyhow::Result<phrona::SourcePolicy> {
+    phrona::SourcePolicy::compile(mode, allowed, denied)
+        .map_err(|e| anyhow::anyhow!("invalid source policy: {e}"))
 }
 
 fn split_sources(s: Option<&str>) -> anyhow::Result<Vec<SuggestSource>> {

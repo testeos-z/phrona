@@ -11,6 +11,9 @@ keywords = ["metasearch", "search-engine", "web-scraping", "serp", "aggregator"]
 categories = ["web-programming", "network-programming"]
 readme = "README.md"
 
+[features]
+test-support = []
+
 [dependencies]
 wreq = { workspace = true }
 wreq-util = { workspace = true }
@@ -22,6 +25,7 @@ serde_yaml = { workspace = true }
 scraper = { workspace = true }
 url = { workspace = true }
 percent-encoding = { workspace = true }
+psl = { workspace = true }
 regex = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }

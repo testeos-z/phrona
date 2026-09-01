@@ -19,7 +19,8 @@ library:
 - Engine chips (loaded from `/v1/engines`): toggle engines on/off; the
   empty selection means "all engines of the category".
 - Parameters: region, language, time range, safesearch, max results,
-  page, filters (`site:...`, DDG image filters, ...), suggestions
+  page, filters (`site:...`, DDG image filters, ...), source policy mode,
+  allowed/excluded domains, suggestions
   on/off.
 - Results: cards per type - images render as a responsive grid, videos
   show thumbnail/duration/views/uploader, news shows date/source, books
@@ -66,10 +67,18 @@ editing them takes effect on reload without a rebuild.
 
 - `GET /v1/engines`
 - `GET /v1/suggest?q=...&region=...`
-- `GET /v1/search?q=...&category=...&engines=...&max_results=...&page=...&region=...&language=...&time_range=...&safesearch=...&filters=...`
-- `GET /v1/extract?url=...&max_chars=...&query=...`
-- `GET /v1/grounding?query=...&max_results=...&category=...&time_range=...`
+- `GET /v1/search?q=...&category=...&engines=...&max_results=...&page=...&region=...&language=...&time_range=...&safesearch=...&filters=...&source_policy_mode=...&allowed_domains=...&excluded_domains=...`
+- `GET /v1/extract?url=...&max_chars=...&query=...&source_policy_mode=...&allowed_domains=...&excluded_domains=...`
+- `GET /v1/grounding?query=...&max_results=...&category=...&time_range=...&source_policy_mode=...&allowed_domains=...&excluded_domains=...`
 - `GET /v1/test?query=...&category=...&max_results=...`
+
+The search, extract, and grounding forms use the REST query-string contract:
+`source_policy_mode` is one mode string and the two domain fields are
+comma-separated hostnames. Empty/omitted fields mean `any`. The frontend sends
+these fields through `URLSearchParams`, never as a nested JSON object; Tavily
+and MCP use the nested `source_policy` object documented separately. Search
+cards expose the returned tier and requested-match state; JSON responses
+retain all policy metadata.
 
 All responses are the shapes documented in [docs/api.md](api.md).
 

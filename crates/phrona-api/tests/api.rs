@@ -282,6 +282,40 @@ async fn tavily_wrong_body_key_is_401() {
 }
 
 #[tokio::test]
+async fn tavily_post_body_api_key_is_accepted_before_payload_validation() {
+    let router = key_router();
+    let (status, json, _) = post_json(&router, "/search", r#"{"api_key": "test-secret"}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("missing field `query`")
+    );
+}
+
+#[test]
+fn grounding_auth_example_marks_get_headers_and_post_body_boundary() {
+    let docs = include_str!("../../../docs/api.md");
+    let grounding = docs
+        .split_once("## GET|POST /v1/grounding")
+        .and_then(|(_, rest)| rest.split_once("## Frontend"))
+        .map(|(section, _)| section)
+        .expect("grounding documentation section");
+    let shared_example = grounding
+        .split_once("Query params (GET) or JSON body (POST):")
+        .and_then(|(_, rest)| rest.split_once("```json"))
+        .and_then(|(_, rest)| rest.split_once("```"))
+        .map(|(example, _)| example)
+        .expect("shared grounding example");
+
+    assert!(grounding.contains("For `GET`, authentication uses headers only"));
+    assert!(grounding.contains("POST-body-only `api_key`"));
+    assert!(!shared_example.contains("\"api_key\""));
+}
+
+#[tokio::test]
 async fn grounding_malformed_json_is_400_json() {
     let router = key_router();
     let (status, json, ct) = post_json_header(&router, "/v1/grounding", "{not json").await;
@@ -296,6 +330,37 @@ async fn tavily_malformed_json_is_400_json() {
     let (status, json, _) = post_json_header(&router, "/v1/tavily", "{not json").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(json["error"].is_string());
+}
+
+#[tokio::test]
+async fn source_policy_validation_is_local_and_shared_by_rest_and_tavily() {
+    let router = open_router();
+    let (status, json, _) = get_header(
+        &router,
+        "/v1/search?q=rust&source_policy_mode=require-allowed&allowed_domains=https%3A%2F%2Fbad.example",
+        "x-api-key",
+        "ignored",
+    ).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source policy")
+    );
+
+    let (status, json, _) = post_json(
+        &router,
+        "/search",
+        r#"{"query":"rust","source_policy":{"mode":"require-allowed","allowed_domains":["https://bad.example"]}}"#,
+    ).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source policy")
+    );
 }
 
 #[tokio::test]

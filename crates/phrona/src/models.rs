@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::source_policy::{PolicyReason, SourceAssessment, SourceMode, SourceTier};
+
 /// The search category, which determines which engines run and how results
 /// are typed. Parse from a string with `"images".parse::<Category>()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -148,6 +150,10 @@ pub struct RawResult {
     pub engine: String,
     /// Position within the engine's own results.
     pub position: u32,
+    /// Local source assessment added after provider output; not serialized as
+    /// part of the raw provider contract.
+    #[serde(skip)]
+    pub source_assessment: Option<SourceAssessment>,
 }
 
 /// A web search result. `engines` lists which providers returned the URL;
@@ -166,6 +172,18 @@ pub struct WebResult {
     pub position: usize,
     /// Merged ranking score in (0, 1].
     pub score: f64,
+    /// Source-policy mode used for this result.
+    #[serde(default)]
+    pub source_policy_mode: SourceMode,
+    /// Whether the source matched the caller's requested scope.
+    #[serde(default)]
+    pub requested_match: bool,
+    /// Operator-assigned source authority.
+    #[serde(default)]
+    pub source_tier: SourceTier,
+    /// Explainability reason for the local source decision.
+    #[serde(default)]
+    pub policy_reason: PolicyReason,
 }
 
 /// An image search result.
@@ -191,6 +209,18 @@ pub struct ImageResult {
     pub position: usize,
     /// Merged ranking score in (0, 1].
     pub score: f64,
+    /// Source-policy mode used for this result.
+    #[serde(default)]
+    pub source_policy_mode: SourceMode,
+    /// Whether the source matched the caller's requested scope.
+    #[serde(default)]
+    pub requested_match: bool,
+    /// Operator-assigned source authority.
+    #[serde(default)]
+    pub source_tier: SourceTier,
+    /// Explainability reason for the local source decision.
+    #[serde(default)]
+    pub policy_reason: PolicyReason,
 }
 
 /// A news search result.
@@ -214,6 +244,18 @@ pub struct NewsResult {
     pub position: usize,
     /// Merged ranking score in (0, 1].
     pub score: f64,
+    /// Source-policy mode used for this result.
+    #[serde(default)]
+    pub source_policy_mode: SourceMode,
+    /// Whether the source matched the caller's requested scope.
+    #[serde(default)]
+    pub requested_match: bool,
+    /// Operator-assigned source authority.
+    #[serde(default)]
+    pub source_tier: SourceTier,
+    /// Explainability reason for the local source decision.
+    #[serde(default)]
+    pub policy_reason: PolicyReason,
 }
 
 /// A video search result.
@@ -241,6 +283,18 @@ pub struct VideoResult {
     pub position: usize,
     /// Merged ranking score in (0, 1].
     pub score: f64,
+    /// Source-policy mode used for this result.
+    #[serde(default)]
+    pub source_policy_mode: SourceMode,
+    /// Whether the source matched the caller's requested scope.
+    #[serde(default)]
+    pub requested_match: bool,
+    /// Operator-assigned source authority.
+    #[serde(default)]
+    pub source_tier: SourceTier,
+    /// Explainability reason for the local source decision.
+    #[serde(default)]
+    pub policy_reason: PolicyReason,
 }
 
 /// A book search result.
@@ -264,6 +318,18 @@ pub struct BookResult {
     pub position: usize,
     /// Merged ranking score in (0, 1].
     pub score: f64,
+    /// Source-policy mode used for this result.
+    #[serde(default)]
+    pub source_policy_mode: SourceMode,
+    /// Whether the source matched the caller's requested scope.
+    #[serde(default)]
+    pub requested_match: bool,
+    /// Operator-assigned source authority.
+    #[serde(default)]
+    pub source_tier: SourceTier,
+    /// Explainability reason for the local source decision.
+    #[serde(default)]
+    pub policy_reason: PolicyReason,
 }
 
 /// A search result tagged by category. JSON serializes as
@@ -281,6 +347,41 @@ pub enum ResultItem {
     Video(VideoResult),
     /// A book result.
     Book(BookResult),
+}
+
+#[cfg(test)]
+mod source_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn result_metadata_is_additive_and_serializes_independently() {
+        let result = WebResult {
+            title: "Docs".into(),
+            url: "https://docs.example.com".into(),
+            description: "".into(),
+            engines: vec!["bing".into()],
+            position: 1,
+            score: 0.9,
+            source_policy_mode: SourceMode::RequireAllowed,
+            requested_match: true,
+            source_tier: SourceTier::Unknown,
+            policy_reason: PolicyReason::Allowed,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["source_policy_mode"], "require-allowed");
+        assert_eq!(json["requested_match"], true);
+        assert_eq!(json["source_tier"], "unknown");
+        assert_eq!(json["policy_reason"], "allowed");
+
+        let legacy: WebResult = serde_json::from_value(serde_json::json!({
+            "title": "Docs", "url": "https://docs.example.com", "description": "",
+            "engines": ["bing"], "position": 1, "score": 0.9
+        }))
+        .unwrap();
+        assert_eq!(legacy.source_policy_mode, SourceMode::Any);
+        assert_eq!(legacy.source_tier, SourceTier::Unknown);
+        assert_eq!(legacy.policy_reason, PolicyReason::Allowed);
+    }
 }
 
 /// Per-engine outcome of a search. `status` is `ok`, `empty` or `error`;

@@ -209,6 +209,20 @@ impl Error {
     }
 }
 
+/// Select the smallest safe `Retry-After` hint from attempted providers.
+/// Hints outside the operator-safe 1..=3600 second range are ignored rather
+/// than allowing an upstream to impose an unbounded wait.
+pub(crate) fn smallest_retry_after<I>(hints: I) -> Option<Duration>
+where
+    I: IntoIterator<Item = Option<Duration>>,
+{
+    hints
+        .into_iter()
+        .flatten()
+        .filter(|hint| *hint >= Duration::from_secs(1) && *hint <= Duration::from_secs(3600))
+        .min()
+}
+
 impl fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -314,5 +328,24 @@ mod tests {
         assert!(s.contains("503"));
         let e = Error::blocked("google", BlockDetails::Cloudflare);
         assert!(e.to_string().contains("blocked (Cloudflare)"));
+    }
+
+    #[test]
+    fn retry_after_uses_smallest_valid_bounded_hint() {
+        let hints = [
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(3601)),
+            Some(Duration::from_secs(0)),
+            None,
+        ];
+        assert_eq!(smallest_retry_after(hints), Some(Duration::from_secs(2)));
+        assert_eq!(
+            smallest_retry_after([
+                Some(Duration::from_secs(0)),
+                Some(Duration::from_secs(3601))
+            ]),
+            None
+        );
     }
 }

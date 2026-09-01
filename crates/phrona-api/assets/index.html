@@ -59,6 +59,16 @@
         <input id="page" class="text-input narrow" type="number" min="1" value="1" title="Page">
         <input id="filters" class="text-input grow" placeholder="filters — e.g. site:github.com" autocomplete="off">
       </div>
+      <div class="param-row source-policy-row">
+        <select id="source-policy-mode" class="select" title="Source policy">
+          <option value="any" selected>source: any</option>
+          <option value="prefer-official">prefer official</option>
+          <option value="require-allowed">require allowed</option>
+          <option value="official-only">official only</option>
+        </select>
+        <input id="allowed-domains" class="text-input grow" placeholder="allowed domains (comma-separated)" autocomplete="off">
+        <input id="excluded-domains" class="text-input grow" placeholder="excluded domains (comma-separated)" autocomplete="off">
+      </div>
       <div class="engines-row" id="engines-row"></div>
       <div class="actions">
         <button id="search-btn" class="raised-btn">Search</button>
@@ -114,6 +124,9 @@
         <input class="text-input grow" placeholder="https://…" required data-f="url">
         <input class="text-input narrow" type="number" min="1" value="5000" title="max chars" data-f="max_chars">
         <input class="text-input" placeholder="bias query (optional)" data-f="query">
+        <select class="select" data-f="source_policy_mode" title="source policy"><option value="any">any</option><option value="prefer-official">prefer-official</option><option value="require-allowed">require-allowed</option><option value="official-only">official-only</option></select>
+        <input class="text-input" placeholder="allowed domains (comma-separated)" data-f="allowed_domains">
+        <input class="text-input" placeholder="excluded domains (comma-separated)" data-f="excluded_domains">
         <button class="raised-btn small">Run</button>
         <label class="check"><input type="checkbox" class="json-check">JSON</label>
       </form>
@@ -129,6 +142,9 @@
           <option value="news">news</option><option value="videos">videos</option>
           <option value="books">books</option>
         </select>
+        <select class="select" data-f="source_policy_mode" title="source policy"><option value="any">any</option><option value="prefer-official">prefer-official</option><option value="require-allowed">require-allowed</option><option value="official-only">official-only</option></select>
+        <input class="text-input" placeholder="allowed domains (comma-separated)" data-f="allowed_domains">
+        <input class="text-input" placeholder="excluded domains (comma-separated)" data-f="excluded_domains">
         <select class="select" data-f="time_range">
           <option value="">any time</option>
           <option value="day">past day</option><option value="week">past week</option>

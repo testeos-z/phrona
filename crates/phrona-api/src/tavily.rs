@@ -1,5 +1,6 @@
 //! Tavily-compatible `/search` endpoint.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -7,8 +8,8 @@ use axum::response::IntoResponse;
 use axum::{Json, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 
-use phrona::SearchOptions;
 use phrona::models::{Category, ResultItem, TimeRange};
+use phrona::{NormalizedDomain, PolicyReason, SearchOptions, SourceMode, SourcePolicy, SourceTier};
 
 use crate::{AppError, AppResult, AppState, JsonBody};
 
@@ -55,6 +56,89 @@ pub struct TavilyRequest {
     #[serde(default)]
     /// Domains to exclude (as `-site:` filters).
     pub exclude_domains: Option<Vec<String>>,
+    /// Additive local source policy. Legacy include/exclude fields remain
+    /// supported and are enforced locally as well as used as provider hints.
+    #[serde(default)]
+    pub source_policy: Option<crate::SourcePolicyParams>,
+}
+
+impl TavilyRequest {
+    fn source_policy(&self) -> crate::AppResult<SourcePolicy> {
+        let Some(request) = &self.source_policy else {
+            let include = self.include_domains.clone().unwrap_or_default();
+            let mode = (!include.is_empty()).then_some("require-allowed");
+            return crate::compile_source_policy(
+                mode,
+                include,
+                self.exclude_domains.clone().unwrap_or_default(),
+            );
+        };
+        let legacy_include = self.include_domains.clone().unwrap_or_default();
+        let has_legacy_include = !legacy_include.is_empty();
+        let allowed = if !has_legacy_include {
+            request.allowed_domains.clone()
+        } else if request.allowed_domains.is_empty() {
+            legacy_include.clone()
+        } else {
+            intersect_domain_scopes(&legacy_include, &request.allowed_domains)?
+        };
+        if has_legacy_include && allowed.is_empty() {
+            return Err(crate::AppError::bad_request(
+                "include_domains and source_policy.allowed_domains have no intersection",
+            ));
+        }
+        let mode = match request.mode.as_deref() {
+            Some(mode) if has_legacy_include => {
+                let parsed = mode.parse::<SourceMode>().map_err(|error| {
+                    crate::AppError::bad_request(format!("invalid source policy: {error}"))
+                })?;
+                match parsed {
+                    // Legacy include_domains is a hard scope constraint. These
+                    // permissive modes cannot be allowed to widen it.
+                    SourceMode::Any | SourceMode::PreferOfficial => Some("require-allowed"),
+                    SourceMode::RequireAllowed | SourceMode::OfficialOnly => Some(mode),
+                }
+            }
+            Some(mode) => Some(mode),
+            None if !allowed.is_empty() => Some("require-allowed"),
+            None => None,
+        };
+        let mut denied = request.excluded_domains.clone();
+        denied.extend(self.exclude_domains.clone().unwrap_or_default());
+        crate::compile_source_policy(mode, allowed, denied)
+    }
+}
+
+fn intersect_domain_scopes(
+    legacy: &[String],
+    requested: &[String],
+) -> crate::AppResult<Vec<String>> {
+    let parse = |domains: &[String]| {
+        domains
+            .iter()
+            .map(|domain| {
+                NormalizedDomain::parse(domain).map_err(|error| {
+                    crate::AppError::bad_request(format!("invalid source policy: {error}"))
+                })
+            })
+            .collect::<crate::AppResult<BTreeSet<_>>>()
+    };
+    let legacy = parse(legacy)?;
+    let requested = parse(requested)?;
+    let mut intersection = BTreeSet::new();
+    for legacy_domain in &legacy {
+        for requested_domain in &requested {
+            if legacy_domain.matches_host(requested_domain.as_str()) {
+                intersection.insert(requested_domain.clone());
+            } else if requested_domain.matches_host(legacy_domain.as_str()) {
+                intersection.insert(legacy_domain.clone());
+            }
+        }
+    }
+    Ok(intersection
+        .into_iter()
+        .map(NormalizedDomain::into_string)
+        .collect())
 }
 
 /// Tavily-compatible response body.
@@ -87,6 +171,21 @@ pub struct TavilyResult {
     pub score: f64,
     /// Raw page text, populated when `include_raw_content` is set.
     pub raw_content: Option<String>,
+    /// Additive source-policy metadata; existing Tavily fields are unchanged.
+    pub source_metadata: SourceMetadata,
+}
+
+/// Source-policy metadata exposed as an additive Tavily result field.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceMetadata {
+    /// Mode used for this result.
+    pub source_policy_mode: SourceMode,
+    /// Whether the URL matched the caller's requested scope.
+    pub requested_match: bool,
+    /// Authority assigned by the operator catalogue.
+    pub source_tier: SourceTier,
+    /// Local eligibility explanation.
+    pub policy_reason: PolicyReason,
 }
 
 fn days_to_range(days: u32) -> Option<TimeRange> {
@@ -108,15 +207,76 @@ fn apply_domains(query: &mut String, include: &[String], exclude: &[String]) {
     }
 }
 
-fn to_tavily_result(r: &ResultItem, pos: usize) -> (String, String, String, f64) {
+fn to_tavily_result(r: &ResultItem, pos: usize) -> (TavilyResult, SourceMetadata) {
     let score = phrona::rank::positional_score(pos);
-    match r {
-        ResultItem::Web(w) => (w.title.clone(), w.url.clone(), w.description.clone(), score),
-        ResultItem::News(n) => (n.title.clone(), n.url.clone(), n.description.clone(), score),
-        ResultItem::Video(v) => (v.title.clone(), v.url.clone(), v.description.clone(), score),
-        ResultItem::Image(i) => (i.title.clone(), i.url.clone(), i.source.clone(), score),
-        ResultItem::Book(b) => (b.title.clone(), b.url.clone(), b.info.clone(), score),
-    }
+    let (title, url, content, metadata) = match r {
+        ResultItem::Web(w) => (
+            &w.title,
+            &w.url,
+            &w.description,
+            SourceMetadata {
+                source_policy_mode: w.source_policy_mode,
+                requested_match: w.requested_match,
+                source_tier: w.source_tier,
+                policy_reason: w.policy_reason,
+            },
+        ),
+        ResultItem::News(n) => (
+            &n.title,
+            &n.url,
+            &n.description,
+            SourceMetadata {
+                source_policy_mode: n.source_policy_mode,
+                requested_match: n.requested_match,
+                source_tier: n.source_tier,
+                policy_reason: n.policy_reason,
+            },
+        ),
+        ResultItem::Video(v) => (
+            &v.title,
+            &v.url,
+            &v.description,
+            SourceMetadata {
+                source_policy_mode: v.source_policy_mode,
+                requested_match: v.requested_match,
+                source_tier: v.source_tier,
+                policy_reason: v.policy_reason,
+            },
+        ),
+        ResultItem::Image(i) => (
+            &i.title,
+            &i.url,
+            &i.source,
+            SourceMetadata {
+                source_policy_mode: i.source_policy_mode,
+                requested_match: i.requested_match,
+                source_tier: i.source_tier,
+                policy_reason: i.policy_reason,
+            },
+        ),
+        ResultItem::Book(b) => (
+            &b.title,
+            &b.url,
+            &b.info,
+            SourceMetadata {
+                source_policy_mode: b.source_policy_mode,
+                requested_match: b.requested_match,
+                source_tier: b.source_tier,
+                policy_reason: b.policy_reason,
+            },
+        ),
+    };
+    (
+        TavilyResult {
+            title: title.clone(),
+            url: url.clone(),
+            content: content.clone(),
+            score,
+            raw_content: None,
+            source_metadata: metadata.clone(),
+        },
+        metadata,
+    )
 }
 
 /// `POST /search`: Tavily-compatible search. Accepts the same body shape as
@@ -166,6 +326,8 @@ pub async fn search(
         opts.time_range = Some(TimeRange::Week);
     }
     opts.max_results = req.max_results.unwrap_or(5).clamp(1, 20);
+    let source_policy = req.source_policy()?;
+    opts.source_policy = source_policy.clone();
     if let Some(include) = &req.include_domains {
         apply_domains(&mut opts.query, include, &[]);
     }
@@ -181,19 +343,13 @@ pub async fn search(
     let mut results: Vec<TavilyResult> = Vec::with_capacity(limit);
     let mut images: Vec<String> = Vec::new();
     for (i, r) in resp.results.iter().take(limit).enumerate() {
-        let (title, url, content, score) = to_tavily_result(r, i);
+        let (result, _) = to_tavily_result(r, i);
         if let ResultItem::Image(img) = r
             && !img.image_url.is_empty()
         {
             images.push(img.image_url.clone());
         }
-        results.push(TavilyResult {
-            title,
-            url,
-            content,
-            score,
-            raw_content: None,
-        });
+        results.push(result);
     }
 
     if req.include_images {
@@ -202,6 +358,7 @@ pub async fn search(
         let mut img_opts = SearchOptions::new(req.query.clone());
         img_opts.category = Category::Images;
         img_opts.max_results = limit.clamp(1, 8);
+        img_opts.source_policy = source_policy.clone();
         if let Ok(img_resp) = state.client.search(img_opts).await {
             for r in img_resp.results.iter().take(8) {
                 if let ResultItem::Image(img) = r
@@ -216,7 +373,15 @@ pub async fn search(
     if req.include_raw_content {
         let client = state.client.http();
         let urls: Vec<String> = results.iter().map(|r| r.url.clone()).collect();
-        let pages = phrona::extract_many(client, &urls, 8000, Some(&req.query)).await;
+        let pages = phrona::extract_many_with_policy(
+            client,
+            &source_policy,
+            state.client.source_catalogue(),
+            &urls,
+            8000,
+            Some(&req.query),
+        )
+        .await;
         for (r, page) in results.iter_mut().zip(pages) {
             r.raw_content = Some(match page {
                 Ok(p) => p.text,
@@ -233,4 +398,145 @@ pub async fn search(
         images: (req.include_images && !images.is_empty()).then_some(images),
         results,
     }))
+}
+
+#[cfg(test)]
+mod source_policy_tests {
+    use super::*;
+
+    #[test]
+    fn nested_policy_is_mapped_without_conferring_authority() {
+        let request: TavilyRequest = serde_json::from_value(serde_json::json!({
+            "query": "rust",
+            "source_policy": {
+                "mode": "require-allowed",
+                "allowed_domains": ["uncatalogued.example"],
+                "excluded_domains": []
+            }
+        }))
+        .unwrap();
+        let policy = request.source_policy().unwrap();
+        let catalogue = phrona::SourceCatalogue::default();
+        let assessment = policy
+            .assessment_for_url("https://uncatalogued.example/docs", &catalogue)
+            .unwrap();
+        assert!(assessment.requested_match);
+        assert_eq!(assessment.source_tier, phrona::SourceTier::Unknown);
+    }
+
+    #[test]
+    fn legacy_include_domains_are_a_local_constraint() {
+        let request: TavilyRequest = serde_json::from_value(serde_json::json!({
+            "query": "rust",
+            "include_domains": ["allowed.example"],
+            "exclude_domains": ["blocked.allowed.example"]
+        }))
+        .unwrap();
+        let policy = request.source_policy().unwrap();
+        let catalogue = phrona::SourceCatalogue::default();
+        assert!(
+            policy
+                .evaluate_url("https://allowed.example/a", &catalogue)
+                .unwrap()
+        );
+        assert!(
+            !policy
+                .evaluate_url("https://blocked.allowed.example/a", &catalogue)
+                .unwrap()
+        );
+        assert!(
+            !policy
+                .evaluate_url("https://other.example/a", &catalogue)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_include_domains_cannot_be_relaxed_by_nested_any_policy() {
+        let request: TavilyRequest = serde_json::from_value(serde_json::json!({
+            "query": "rust",
+            "include_domains": ["allowed.example"],
+            "exclude_domains": ["blocked.allowed.example"],
+            "source_policy": {
+                "mode": "any",
+                "allowed_domains": [],
+                "excluded_domains": []
+            }
+        }))
+        .unwrap();
+        let policy = request.source_policy().unwrap();
+        let catalogue = phrona::SourceCatalogue::default();
+
+        assert!(
+            policy
+                .evaluate_url("https://allowed.example/docs", &catalogue)
+                .unwrap()
+        );
+        assert!(
+            !policy
+                .evaluate_url("https://other.example/docs", &catalogue)
+                .unwrap()
+        );
+        assert!(
+            !policy
+                .evaluate_url("https://blocked.allowed.example/docs", &catalogue)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_and_nested_allowed_domains_are_intersected() {
+        let request: TavilyRequest = serde_json::from_value(serde_json::json!({
+            "query": "rust",
+            "include_domains": ["example.com"],
+            "source_policy": {
+                "mode": "prefer-official",
+                "allowed_domains": ["docs.example.com", "other.example"],
+                "excluded_domains": []
+            }
+        }))
+        .unwrap();
+        let policy = request.source_policy().unwrap();
+        let catalogue = phrona::SourceCatalogue::default();
+
+        assert!(
+            policy
+                .evaluate_url("https://docs.example.com/guide", &catalogue)
+                .unwrap()
+        );
+        assert!(
+            !policy
+                .evaluate_url("https://example.com/guide", &catalogue)
+                .unwrap()
+        );
+        assert!(
+            !policy
+                .evaluate_url("https://other.example/guide", &catalogue)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn tavily_result_metadata_is_additive_and_tiered() {
+        let raw = phrona::ResultItem::Web(phrona::WebResult {
+            title: "Docs".into(),
+            url: "https://docs.example".into(),
+            description: "text".into(),
+            engines: vec!["bing".into()],
+            position: 1,
+            score: 1.0,
+            source_policy_mode: phrona::SourceMode::RequireAllowed,
+            requested_match: true,
+            source_tier: phrona::SourceTier::Official,
+            policy_reason: phrona::PolicyReason::Allowed,
+        });
+        let (result, _) = to_tavily_result(&raw, 0);
+        assert_eq!(
+            result.source_metadata.source_tier,
+            phrona::SourceTier::Official
+        );
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json["source_metadata"]["requested_match"], true);
+        assert_eq!(json["source_metadata"]["source_tier"], "official");
+    }
 }

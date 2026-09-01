@@ -16,7 +16,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use phrona_core::{Category, Profile, SearchClient, SearchOptions};
+use phrona_core::{Category, PhronaConfig, Profile, SearchClient, SearchOptions, SourcePolicy};
 
 /// Dedicated multi-threaded runtime for all blocking calls. Network I/O runs
 /// on this runtime with the Python GIL released, so Python threads and
@@ -42,6 +42,45 @@ fn parse_category(s: &str) -> PyResult<Category> {
     s.parse::<Category>().map_err(|_| {
         PyValueError::new_err("category must be one of: web, images, news, videos, books")
     })
+}
+
+fn parse_source_policy(
+    mode: &str,
+    allowed: Option<Vec<String>>,
+    denied: Option<Vec<String>>,
+) -> PyResult<SourcePolicy> {
+    SourcePolicy::compile(
+        mode,
+        allowed.unwrap_or_default(),
+        denied.unwrap_or_default(),
+    )
+    .map_err(|e| PyValueError::new_err(format!("invalid source policy: {e}")))
+}
+
+#[cfg(test)]
+mod source_policy_tests {
+    use super::*;
+
+    #[test]
+    fn python_policy_arguments_use_core_validation() {
+        let policy = parse_source_policy(
+            "require-allowed",
+            Some(vec!["Docs.Example".into()]),
+            Some(vec!["private.docs.example".into()]),
+        )
+        .unwrap();
+        assert_eq!(policy.mode(), phrona_core::SourceMode::RequireAllowed);
+        assert_eq!(policy.allowed()[0].as_str(), "docs.example");
+        assert_eq!(policy.denied()[0].as_str(), "private.docs.example");
+    }
+
+    #[test]
+    fn omitted_python_policy_is_any() {
+        assert_eq!(
+            parse_source_policy("any", None, None).unwrap().mode(),
+            phrona_core::SourceMode::Any
+        );
+    }
 }
 
 fn to_py(py: Python<'_>, v: &impl serde::Serialize) -> PyResult<Py<PyAny>> {
@@ -96,21 +135,28 @@ impl Client {
     #[new]
     #[pyo3(signature = (profile="chrome", timeout=15.0))]
     fn new(profile: &str, timeout: f64) -> PyResult<Self> {
+        let cfg = PhronaConfig::load().map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let catalogue = cfg
+            .source_catalogue()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let client = SearchClient::with_options(
             parse_profile(profile)?,
             Some(Duration::from_secs_f64(timeout.max(1.0))),
             None,
-            phrona_core::TargetPolicy::default(),
+            phrona_core::TargetPolicy::from_security(&cfg.security),
         )
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { client })
+        Ok(Self {
+            client: client.with_source_catalogue(catalogue),
+        })
     }
 
     /// Search all engines for a query. Returns a dict with results, engines
     /// report, suggestions and elapsed time.
     #[pyo3(signature = (query, category="web", engines=None, page=1, max_results=20,
                         safesearch="moderate", region=None, language=None,
-                        time_range=None, filters=None))]
+                        time_range=None, filters=None, source_policy_mode="any",
+                        allowed_domains=None, excluded_domains=None))]
     #[allow(clippy::too_many_arguments)]
     fn search(
         &self,
@@ -125,6 +171,9 @@ impl Client {
         language: Option<String>,
         time_range: Option<String>,
         filters: Option<String>,
+        source_policy_mode: &str,
+        allowed_domains: Option<Vec<String>>,
+        excluded_domains: Option<Vec<String>>,
     ) -> PyResult<Py<PyAny>> {
         let mut opts = SearchOptions::new(query);
         opts.category = parse_category(category)?;
@@ -144,6 +193,8 @@ impl Client {
             })
             .transpose()?;
         opts.filters = filters;
+        opts.source_policy =
+            parse_source_policy(source_policy_mode, allowed_domains, excluded_domains)?;
         let resp = py
             .detach(|| {
                 RUNTIME
@@ -199,19 +250,29 @@ impl Client {
     }
 
     /// Fetch a URL and extract its readable main content (AI grounding).
-    #[pyo3(signature = (url, max_chars=8000, query=None))]
+    // Keep the additive Python keyword arguments in the public method
+    // signature rather than hiding them behind a breaking wrapper.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (url, max_chars=8000, query=None, source_policy_mode="any",
+                        allowed_domains=None, excluded_domains=None))]
     fn extract(
         &self,
         py: Python<'_>,
         url: &str,
         max_chars: usize,
         query: Option<&str>,
+        source_policy_mode: &str,
+        allowed_domains: Option<Vec<String>>,
+        excluded_domains: Option<Vec<String>>,
     ) -> PyResult<Py<PyAny>> {
+        let policy = parse_source_policy(source_policy_mode, allowed_domains, excluded_domains)?;
         let page = py
             .detach(|| {
                 RUNTIME
-                    .block_on(phrona_core::extract(
+                    .block_on(phrona_core::extract_with_policy(
                         self.client.http(),
+                        &policy,
+                        self.client.source_catalogue(),
                         url,
                         max_chars,
                         query,
@@ -253,8 +314,9 @@ fn build_client(profile: &str, timeout: f64) -> PyResult<Client> {
 /// One-shot search with a default client. Same parameters as Client.search.
 #[pyfunction]
 #[pyo3(signature = (query, category="web", engines=None, page=1, max_results=20,
-                    safesearch="moderate", region=None, language=None,
-                    time_range=None, filters=None, profile="chrome", timeout=15.0))]
+                     safesearch="moderate", region=None, language=None,
+                     time_range=None, filters=None, profile="chrome", timeout=15.0,
+                     source_policy_mode="any", allowed_domains=None, excluded_domains=None))]
 #[allow(clippy::too_many_arguments)]
 fn search(
     py: Python<'_>,
@@ -270,6 +332,9 @@ fn search(
     filters: Option<String>,
     profile: &str,
     timeout: f64,
+    source_policy_mode: &str,
+    allowed_domains: Option<Vec<String>>,
+    excluded_domains: Option<Vec<String>>,
 ) -> PyResult<Py<PyAny>> {
     let client = build_client(profile, timeout)?;
     client.search(
@@ -284,6 +349,9 @@ fn search(
         language,
         time_range,
         filters,
+        source_policy_mode,
+        allowed_domains,
+        excluded_domains,
     )
 }
 
@@ -301,14 +369,26 @@ fn suggest(
 
 /// One-shot page extraction with a default client.
 #[pyfunction]
-#[pyo3(signature = (url, max_chars=8000, query=None))]
+#[pyo3(signature = (url, max_chars=8000, query=None, source_policy_mode="any",
+                    allowed_domains=None, excluded_domains=None))]
 fn extract(
     py: Python<'_>,
     url: &str,
     max_chars: usize,
     query: Option<&str>,
+    source_policy_mode: &str,
+    allowed_domains: Option<Vec<String>>,
+    excluded_domains: Option<Vec<String>>,
 ) -> PyResult<Py<PyAny>> {
-    build_client("chrome", 15.0)?.extract(py, url, max_chars, query)
+    build_client("chrome", 15.0)?.extract(
+        py,
+        url,
+        max_chars,
+        query,
+        source_policy_mode,
+        allowed_domains,
+        excluded_domains,
+    )
 }
 
 /// One-shot engines listing with a default client.

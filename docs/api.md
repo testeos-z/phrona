@@ -15,12 +15,20 @@ milliseconds.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PHRONA_ADDR` | `127.0.0.1:8080` | bind address |
-| `PHRONA_API_KEY` | unset | if set, `/v1/*` (except `/health`) and `/search` require a key |
+| `PHRONA_API_KEY` | unset | if set, protected `/v1/*` data routes and `/search` require a key |
 | `RUST_LOG` | `info` | tracing level (use `debug` for detail) |
 
-When a key is set, clients authenticate with the header
-`Authorization: Bearer <key>`, the header `x-api-key: <key>`, the query
-parameter `api_key=...` or the JSON field `"api_key": "..."`.
+When a key is set, clients authenticate protected GET routes with either
+`x-api-key: <key>` or `Authorization: Bearer <key>`. A GET query-string
+credential such as `api_key=...` is rejected with HTTP 400 and never
+authenticates. JSON-body `api_key` credentials are supported only on the POST
+routes listed below; those routes also accept either authentication header.
+
+| Route/method | Authentication |
+| --- | --- |
+| `GET /v1/search`, `/v1/suggest`, `/v1/test`, `/v1/extract`, `/v1/grounding` | `x-api-key` or `Authorization: Bearer`; query-string `api_key` returns HTTP 400 |
+| `POST /search`, `/v1/tavily`, `/v1/extract`, `/v1/grounding` | JSON-body `api_key` or either authentication header |
+| `GET /health`, `GET /v1/engines`, `GET /metrics`, frontend routes | public; no authentication |
 
 ## GET /
 
@@ -70,7 +78,10 @@ Query parameters:
 | `language` | string | unset | e.g. `en` |
 | `time_range` | string | unset | `day`, `week`, `month`, `year` |
 | `filters` | string | unset | engine filter string (e.g. `site:github.com`) |
-| `api_key` | string | - | auth when key set |
+| `source_policy_mode` | string | `any` | `any`, `prefer-official`, `require-allowed`, or `official-only` |
+| `allowed_domains` | CSV | empty | caller-requested hostname scope |
+| `excluded_domains` | CSV | empty | caller-excluded hostnames; exclusions win |
+| `api_key` | string | rejected | GET query-string credentials return HTTP 400; use an authentication header |
 
 Response:
 
@@ -100,6 +111,18 @@ Response:
   "elapsed_ms": 1200
 }
 ```
+
+Each result also includes additive `source_policy_mode`, `requested_match`,
+`source_tier` (`official`, `secondary`, or `unknown`) and `policy_reason`.
+Authority comes only from the operator `sources` catalogue; requested domains
+never self-certify. Checks are local and happen before aggregation and
+fetches, so strict modes may return fewer results without extra DNS, retries,
+waits, or deadline extensions. Existing SSRF and redirect checks remain active.
+Hostname policy inputs are checked against the pinned `psl` dependency
+(`2.1.226`), which bundles a Mozilla Public Suffix List snapshot with ICANN
+and PRIVATE rules. Updating that local snapshot is a dependency upgrade, not
+a runtime lookup; single-label extraction URLs remain delegated to the existing
+TargetPolicy/SSRF guard for compatibility.
 
 Result fields by type:
 
@@ -138,6 +161,23 @@ the library's `extract`). Query params (GET) or JSON body (POST):
 | `url` | required | page to fetch and extract |
 | `max_chars` | `5000` | max characters of extracted text (1-100000) |
 | `query` | unset | bias the excerpt toward this query |
+| `source_policy_mode` | `any` | `any`, `prefer-official`, `require-allowed`, or `official-only` |
+| `allowed_domains` | empty | CSV caller-requested hostname scope |
+| `excluded_domains` | empty | CSV caller-excluded hostnames; exclusions win |
+
+The GET form sends the three policy fields as query parameters. The POST JSON
+form uses the same field names, with `allowed_domains` and `excluded_domains`
+as arrays:
+
+```json
+{
+  "url": "https://docs.example.com/guide",
+  "max_chars": 5000,
+  "source_policy_mode": "require-allowed",
+  "allowed_domains": ["docs.example.com"],
+  "excluded_domains": ["private.docs.example.com"]
+}
+```
 
 Response is the `ExtractedPage` shape:
 
@@ -185,6 +225,8 @@ Response: an array of per-category reports.
 ## POST /search and POST /v1/tavily
 
 Tavily-compatible endpoint for drop-in replacement in Tavily clients.
+The JSON-body `api_key` shown below is POST-only. `x-api-key` and
+`Authorization: Bearer` headers are supported alternatives.
 
 ```json
 {
@@ -198,7 +240,12 @@ Tavily-compatible endpoint for drop-in replacement in Tavily clients.
   "include_answer": false,
   "include_raw_content": false,
   "include_domains": ["example.com"],
-  "exclude_domains": ["spam.net"]
+  "exclude_domains": ["spam.net"],
+  "source_policy": {
+    "mode": "require-allowed",
+    "allowed_domains": ["example.com"],
+    "excluded_domains": []
+  }
 }
 ```
 
@@ -213,9 +260,13 @@ Tavily-compatible endpoint for drop-in replacement in Tavily clients.
 | `include_images` | adds `images` field |
 | `include_answer` | adds `answer` field; the grokipedia answer engine is queried for this |
 | `include_raw_content` | adds `raw_content` (full extracted page text, capped) |
-| `include_domains` / `exclude_domains` | filters returned results by host |
+| `include_domains` / `exclude_domains` | legacy host filters, enforced locally and also translated to provider hints |
+| `source_policy` | additive object with `mode`, `allowed_domains`, `excluded_domains` |
 
-Response is the Tavily shape:
+Response is the Tavily shape. Each result has additive `source_metadata` with
+the same mode, requested-match, authority-tier and policy-reason fields; the
+legacy result fields remain unchanged. Raw-content fetches apply the same
+policy to the initial URL and every redirect.
 
 ```json
 {
@@ -237,12 +288,16 @@ sources with content, all with citation-ready attribution. The library
 answer (from the grokipedia answer engine) is used verbatim when present;
 otherwise the strongest snippets are stitched into an extractive summary.
 
+For `GET`, authentication uses headers only: `x-api-key` or
+`Authorization: Bearer`. A query-string `api_key` returns HTTP 400 and never
+authenticates. For `POST`, the POST-body-only `api_key` may be supplied in the
+JSON body, with either header accepted as an alternative.
+
 Query params (GET) or JSON body (POST):
 
 ```json
 {
   "query": "serde json",
-  "api_key": "...",
   "max_results": 8,
   "category": "web",
   "time_range": "week",
@@ -250,9 +305,15 @@ Query params (GET) or JSON body (POST):
   "region": "us-en",
   "language": "en",
   "safesearch": "moderate",
-  "filters": null
+  "filters": null,
+  "source_policy_mode": "prefer-official",
+  "allowed_domains": "docs.rs,serde.rs",
+  "excluded_domains": "private.docs.rs"
 }
 ```
+
+The GET and POST grounding forms use these same policy fields as strings
+(domain lists are comma-separated CSV). Omitted policy fields select `any`.
 
 Response:
 
@@ -261,7 +322,9 @@ Response:
   "query": "serde json",
   "answer": "Extractive summary for \"serde json\":\nSource 1 (https://serde.rs/json.html): ...",
   "sources": [
-    {"title": "JSON Format - serde", "url": "https://serde.rs/json.html", "content": "...", "score": 1.0}
+    {"title": "JSON Format - serde", "url": "https://serde.rs/json.html", "content": "...", "score": 1.0,
+     "source_policy_mode": "prefer-official", "requested_match": true,
+     "source_tier": "official", "policy_reason": "allowed"}
   ],
   "response_time": 1.1
 }
@@ -273,6 +336,9 @@ unknown engine names in `engines` are rejected with a 400. Source
 scores are positional (`phrona::rank::positional_score`: 1.0 decaying
 by 0.05 per position, floored at 0.05) - identical to the Tavily
 endpoint and MCP `search_grounded`.
+
+Grounding sources include additive `source_policy_mode`, `requested_match`,
+`source_tier`, and `policy_reason` fields, matching native search metadata.
 
 ## Frontend
 

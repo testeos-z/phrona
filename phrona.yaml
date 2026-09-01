@@ -25,6 +25,9 @@
 #   PHRONA_SECURITY_DENIED_DOMAINS    security.denied_domains (comma list)
 #   PHRONA_ENGINES_PROXIES            engines.proxies (comma list)
 #   PHRONA_ENGINES_PROFILE            engines.profile
+#
+# Source authority is operator-owned and has no environment override. Caller
+# requests constrain scope but cannot make a source official.
 
 server:
   # REST API bind address (default: 127.0.0.1:8080)
@@ -63,6 +66,12 @@ security:
   allowed_domains: []
   # Optional deny-list of hostnames for outbound requests.
   denied_domains: []
+
+sources:
+  # Only configured domains receive source_tier=official.
+  official: []
+  # Configured reputable domains receive source_tier=secondary.
+  secondary: []
 
 engines:
   # Proxy URLs; one impersonated HTTP client is pooled per proxy and used

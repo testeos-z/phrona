@@ -7,7 +7,7 @@ Python or the web UI.
 ```text
                   phrona (core library)
                  engines | dedup | rank | extract | suggest
-                   client | options | models | parse
+                    client | options | models | source_policy | parse
         |              |              |              |
   phrona-api   phrona-mcp  phrona-python  phrona-cli
    (axum REST)      (rmcp MCP)      (pyo3 bindings)   (phrona: all-in-one)
@@ -49,6 +49,7 @@ every interface is a different door into the same code.
 | `extract` | readable-text extraction and query-biased excerpts (grounding) |
 | `options` | `SearchOptions` with categories, regions, time ranges, safesearch, filters |
 | `models` | `ResultItem` union (web/image/news/video/book), `SearchResponse`, `EngineReport` |
+| `source_policy` | local normalized scope matching, operator authority catalogue, and explainable admission |
 | `error` | structured `Error { scope, kind, engine, http_status, message }` — allocation-free, typed `From<wreq::Error>` |
 
 ## Availability design
@@ -66,6 +67,15 @@ every interface is a different door into the same code.
   query problem vs internal) plus the observable `kind`, so callers can
   react differently; an error is only raised when *every* engine failed
   (`AllProvidersFailed`), otherwise empty results are honest.
+- Adapter inputs map to the same `SourcePolicy`; policy evaluation is in-memory
+  before aggregation and raw fetch/redirect hops. No authority or safety
+  decision performs runtime DNS/reputation/LLM work.
+- Hostname validation uses the pinned `psl` dependency (`2.1.226`), which
+  bundles a Mozilla Public Suffix List snapshot including ICANN and PRIVATE
+  rules. It is deterministic and local; refreshing the snapshot requires a
+  dependency upgrade, never a runtime network/DNS lookup. Single-label hosts
+  remain outside request-domain policy validation in permissive extraction
+  paths and are left to the existing SSRF/TargetPolicy guard.
 - The `test` command and `/health` expose live availability for
   monitoring.
 - The `upstream-watch` workflow detects when the scraped upstream

@@ -18,7 +18,22 @@ use schemars::JsonSchema;
 use tokio_util::sync::CancellationToken;
 
 use phrona::models::{Category, TimeRange};
-use phrona::{PhronaConfig, ResultItem, SearchClient, SearchOptions};
+use phrona::{PhronaConfig, ResultItem, SearchClient, SearchOptions, SourcePolicy};
+
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+struct SourcePolicyParams {
+    #[schemars(
+        description = "Admission mode: any, prefer-official, require-allowed or official-only"
+    )]
+    #[serde(default)]
+    mode: Option<String>,
+    #[schemars(description = "Caller-requested hostname list")]
+    #[serde(default)]
+    allowed_domains: Vec<String>,
+    #[schemars(description = "Caller-excluded hostname list")]
+    #[serde(default)]
+    excluded_domains: Vec<String>,
+}
 
 #[derive(Debug, serde::Deserialize, JsonSchema)]
 struct SearchParams {
@@ -50,6 +65,9 @@ struct SearchParams {
     #[schemars(description = "Result page (default 1)")]
     #[serde(default)]
     page: Option<u32>,
+    #[schemars(description = "Local source policy; omitted means any")]
+    #[serde(default)]
+    source_policy: Option<SourcePolicyParams>,
 }
 
 #[derive(Debug, serde::Deserialize, JsonSchema)]
@@ -64,6 +82,9 @@ struct FetchParams {
     )]
     #[serde(default)]
     query: Option<String>,
+    #[schemars(description = "Local source policy; omitted means any")]
+    #[serde(default)]
+    source_policy: Option<SourcePolicyParams>,
 }
 
 #[derive(Debug, serde::Deserialize, JsonSchema)]
@@ -140,6 +161,15 @@ impl PhronaMcp {
         if let Some(page) = p.page {
             opts.page = page.max(1);
         }
+        opts.source_policy = match &p.source_policy {
+            Some(policy) => SourcePolicy::compile(
+                policy.mode.as_deref().unwrap_or("any"),
+                &policy.allowed_domains,
+                &policy.excluded_domains,
+            )
+            .map_err(|e| format!("invalid source policy: {e}"))?,
+            None => SourcePolicy::default(),
+        };
         Ok(opts)
     }
 
@@ -175,6 +205,46 @@ impl PhronaMcp {
 fn envelope(v: serde_json::Value) -> String {
     serde_json::to_string(&v)
         .unwrap_or_else(|_| r#"{"error":"internal serialization failure"}"#.to_string())
+}
+
+fn source_policy_mode(r: &ResultItem) -> phrona::SourceMode {
+    match r {
+        ResultItem::Web(v) => v.source_policy_mode,
+        ResultItem::Image(v) => v.source_policy_mode,
+        ResultItem::News(v) => v.source_policy_mode,
+        ResultItem::Video(v) => v.source_policy_mode,
+        ResultItem::Book(v) => v.source_policy_mode,
+    }
+}
+
+fn requested_match(r: &ResultItem) -> bool {
+    match r {
+        ResultItem::Web(v) => v.requested_match,
+        ResultItem::Image(v) => v.requested_match,
+        ResultItem::News(v) => v.requested_match,
+        ResultItem::Video(v) => v.requested_match,
+        ResultItem::Book(v) => v.requested_match,
+    }
+}
+
+fn source_tier(r: &ResultItem) -> phrona::SourceTier {
+    match r {
+        ResultItem::Web(v) => v.source_tier,
+        ResultItem::Image(v) => v.source_tier,
+        ResultItem::News(v) => v.source_tier,
+        ResultItem::Video(v) => v.source_tier,
+        ResultItem::Book(v) => v.source_tier,
+    }
+}
+
+fn policy_reason(r: &ResultItem) -> phrona::PolicyReason {
+    match r {
+        ResultItem::Web(v) => v.policy_reason,
+        ResultItem::Image(v) => v.policy_reason,
+        ResultItem::News(v) => v.policy_reason,
+        ResultItem::Video(v) => v.policy_reason,
+        ResultItem::Book(v) => v.policy_reason,
+    }
 }
 
 #[tool_router(server_handler)]
@@ -216,8 +286,25 @@ impl PhronaMcp {
         description = "Fetch a URL and extract its readable main content. Use for grounding answers on the sources returned by web_search."
     )]
     async fn fetch_page(&self, Parameters(p): Parameters<FetchParams>) -> String {
-        match phrona::extract(
+        let policy = match &p.source_policy {
+            Some(policy) => match SourcePolicy::compile(
+                policy.mode.as_deref().unwrap_or("any"),
+                &policy.allowed_domains,
+                &policy.excluded_domains,
+            ) {
+                Ok(policy) => policy,
+                Err(e) => {
+                    return envelope(
+                        serde_json::json!({"error": format!("invalid source policy: {e}")}),
+                    );
+                }
+            },
+            None => SourcePolicy::default(),
+        };
+        match phrona::extract_with_policy(
             self.client.http(),
+            &policy,
+            self.client.source_catalogue(),
             &p.url,
             p.max_chars.unwrap_or(8000),
             p.query.as_deref(),
@@ -335,6 +422,10 @@ impl PhronaMcp {
                             "url": url,
                             "content": content,
                             "score": phrona::rank::positional_score(i),
+                            "source_policy_mode": source_policy_mode(r),
+                            "requested_match": requested_match(r),
+                            "source_tier": source_tier(r),
+                            "policy_reason": policy_reason(r),
                         }))
                     })
                     .collect();
@@ -391,8 +482,7 @@ pub async fn serve_tcp(
     let service = StreamableHttpService::new(
         move || Ok(PhronaMcp::with_config(&service_cfg)),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default()
-            .with_cancellation_token(transport_cancellation),
+        StreamableHttpServerConfig::default().with_cancellation_token(transport_cancellation),
     );
 
     let router = axum::Router::new().nest_service("/mcp", service);
@@ -415,7 +505,16 @@ pub async fn tcp_listener(addr: &str) -> anyhow::Result<tokio::net::TcpListener>
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use async_trait::async_trait;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use phrona::engine::{Engine, EngineContext};
+    use phrona::error::Error;
+    use phrona::models::RawResult;
+    use tower::ServiceExt;
 
     fn params(query: &str) -> SearchParams {
         SearchParams {
@@ -428,6 +527,7 @@ mod tests {
             safesearch: None,
             filters: None,
             page: None,
+            source_policy: None,
         }
     }
 
@@ -438,6 +538,32 @@ mod tests {
         assert_eq!(opts.max_results, 20);
         assert_eq!(opts.safesearch, phrona::SafeSearch::Moderate);
         assert_eq!(opts.page, 1);
+    }
+
+    #[test]
+    fn build_opts_maps_nested_source_policy() {
+        let mut p = params("rust");
+        p.source_policy = Some(SourcePolicyParams {
+            mode: Some("require-allowed".into()),
+            allowed_domains: vec!["docs.example".into()],
+            excluded_domains: vec!["private.docs.example".into()],
+        });
+        let opts = PhronaMcp::build_opts(&p, Category::Web, 100).unwrap();
+        assert_eq!(
+            opts.source_policy.mode(),
+            phrona::SourceMode::RequireAllowed
+        );
+        assert_eq!(opts.source_policy.allowed()[0].as_str(), "docs.example");
+        assert_eq!(
+            opts.source_policy.denied()[0].as_str(),
+            "private.docs.example"
+        );
+    }
+
+    #[test]
+    fn omitted_mcp_source_policy_defaults_to_any() {
+        let opts = PhronaMcp::build_opts(&params("rust"), Category::Web, 100).unwrap();
+        assert_eq!(opts.source_policy.mode(), phrona::SourceMode::Any);
     }
 
     #[test]
@@ -492,5 +618,266 @@ mod tests {
                 .as_str()
                 .is_some_and(|e| e.contains("time_range"))
         );
+    }
+
+    struct ParityEngine {
+        outcome: Result<Vec<RawResult>, Error>,
+    }
+
+    #[async_trait]
+    impl Engine for ParityEngine {
+        fn name(&self) -> &'static str {
+            "offline-parity"
+        }
+
+        fn category(&self) -> Category {
+            Category::Web
+        }
+
+        async fn search(&self, _ctx: &EngineContext<'_>) -> phrona::Result<Vec<RawResult>> {
+            self.outcome.clone()
+        }
+    }
+
+    fn result(title: &str, url: &str) -> RawResult {
+        RawResult {
+            title: title.into(),
+            url: url.into(),
+            description: format!("{title} description"),
+            engine: "offline-parity".into(),
+            ..Default::default()
+        }
+    }
+
+    fn parity_params() -> SearchParams {
+        SearchParams {
+            query: "offline parity".into(),
+            engines: None,
+            max_results: Some(20),
+            region: None,
+            language: None,
+            time_range: None,
+            safesearch: None,
+            filters: None,
+            page: Some(2),
+            source_policy: Some(SourcePolicyParams {
+                mode: Some("require-allowed".into()),
+                allowed_domains: vec![
+                    "official.example.test".into(),
+                    "requested.example.test".into(),
+                ],
+                excluded_domains: vec!["excluded.example.test".into()],
+            }),
+        }
+    }
+
+    fn parity_client(engine: &'static ParityEngine) -> SearchClient {
+        SearchClient::new()
+            .unwrap()
+            .with_source_catalogue(
+                phrona::SourceCatalogue::compile(
+                    ["official.example.test"],
+                    ["secondary.example.test"],
+                )
+                .unwrap(),
+            )
+            .with_test_engines(vec![engine])
+    }
+
+    async fn rest_search_at(client: SearchClient, uri: &str) -> (StatusCode, serde_json::Value) {
+        let state = phrona_api::AppState::new(client, None, 100, 0, 100_000, Vec::new());
+        let response = phrona_api::router_with_state(state)
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 100_000)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn rest_search(client: SearchClient) -> (StatusCode, serde_json::Value) {
+        rest_search_at(
+            client,
+            "/v1/search?q=offline%20parity&page=2&max_results=20&source_policy_mode=require-allowed&allowed_domains=official.example.test%2Crequested.example.test&excluded_domains=excluded.example.test",
+        )
+        .await
+    }
+
+    fn without_timing(mut value: serde_json::Value) -> serde_json::Value {
+        value
+            .as_object_mut()
+            .expect("search response is an object")
+            .remove("elapsed_ms");
+        value
+    }
+
+    fn expected_success_payload() -> serde_json::Value {
+        serde_json::json!({
+            "query": "offline parity",
+            "category": "web",
+            "page": 2,
+            "total": 3,
+            "results": [
+                {
+                    "type": "web",
+                    "title": "official",
+                    "url": "https://official.example.test/guide",
+                    "description": "official description",
+                    "engines": ["offline-parity"],
+                    "position": 1,
+                    "score": 0.818,
+                    "source_policy_mode": "require-allowed",
+                    "requested_match": true,
+                    "source_tier": "official",
+                    "policy_reason": "allowed"
+                },
+                {
+                    "type": "web",
+                    "title": "secondary",
+                    "url": "https://secondary.example.test/reference",
+                    "description": "secondary description",
+                    "engines": ["offline-parity"],
+                    "position": 2,
+                    "score": 0.818,
+                    "source_policy_mode": "require-allowed",
+                    "requested_match": false,
+                    "source_tier": "secondary",
+                    "policy_reason": "allowed"
+                },
+                {
+                    "type": "web",
+                    "title": "requested unknown",
+                    "url": "https://requested.example.test/page",
+                    "description": "requested unknown description",
+                    "engines": ["offline-parity"],
+                    "position": 3,
+                    "score": 0.818,
+                    "source_policy_mode": "require-allowed",
+                    "requested_match": true,
+                    "source_tier": "unknown",
+                    "policy_reason": "allowed"
+                }
+            ],
+            "suggestions": [],
+            "answer": null,
+            "engines": [{
+                "name": "offline-parity",
+                "status": "ok",
+                "results": 3,
+                "error": null,
+                "scope": null,
+                "kind": null
+            }]
+        })
+    }
+
+    fn assert_complete_engine_error(
+        rest_status: StatusCode,
+        rest: &serde_json::Value,
+        mcp: &serde_json::Value,
+        expected_error: &str,
+    ) {
+        assert_eq!(rest_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            rest,
+            &serde_json::json!({"error": expected_error}),
+            "REST error payload changed: {rest}"
+        );
+        assert_eq!(
+            mcp,
+            &serde_json::json!({
+                "query": "offline parity",
+                "total": 0,
+                "results": [],
+                "error": expected_error
+            }),
+            "MCP error payload changed: {mcp}"
+        );
+        assert_eq!(rest["error"], mcp["error"]);
+    }
+
+    #[tokio::test]
+    async fn rest_and_mcp_search_match_for_offline_engine() {
+        let engine = Box::leak(Box::new(ParityEngine {
+            outcome: Ok(vec![
+                result("official", "https://official.example.test/guide"),
+                result("secondary", "https://secondary.example.test/reference"),
+                result("requested unknown", "https://requested.example.test/page"),
+                result("excluded", "https://excluded.example.test/no"),
+                result("unrelated", "https://unrelated.example.test/no"),
+            ]),
+        }));
+        let (rest_status, rest) = rest_search(parity_client(engine)).await;
+        let mcp = PhronaMcp {
+            client: Arc::new(parity_client(engine)),
+            max_results_limit: 100,
+        };
+        let mcp: serde_json::Value =
+            serde_json::from_str(&mcp.web_search(Parameters(parity_params())).await).unwrap();
+
+        assert_eq!(rest_status, StatusCode::OK, "REST payload: {rest}");
+        let expected = expected_success_payload();
+        let rest = without_timing(rest);
+        let mcp = without_timing(mcp);
+        assert_eq!(rest, expected, "REST payload drifted: {rest}");
+        assert_eq!(mcp, expected, "MCP payload drifted: {mcp}");
+        assert_eq!(rest, mcp, "REST/MCP stable payloads differ");
+    }
+
+    #[tokio::test]
+    async fn rest_and_mcp_report_the_same_offline_engine_failure() {
+        let engine = Box::leak(Box::new(ParityEngine {
+            outcome: Err(Error::network("offline-parity")),
+        }));
+        let (rest_status, rest) = rest_search(parity_client(engine)).await;
+        let mcp = PhronaMcp {
+            client: Arc::new(parity_client(engine)),
+            max_results_limit: 100,
+        };
+        let mcp: serde_json::Value =
+            serde_json::from_str(&mcp.web_search(Parameters(parity_params())).await).unwrap();
+
+        assert_complete_engine_error(
+            rest_status,
+            &rest,
+            &mcp,
+            "all search providers failed: offline-parity: network failure [scope=Egress, engine=offline-parity] [scope=Provider, engine=orchestrator]",
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_and_mcp_report_the_same_invalid_policy_error() {
+        let mut params = parity_params();
+        params.source_policy.as_mut().unwrap().mode = Some("invalid-mode".into());
+        let (rest_status, rest) = rest_search_at(
+            SearchClient::new().unwrap(),
+            "/v1/search?q=offline%20parity&page=2&source_policy_mode=invalid-mode&allowed_domains=official.example.test",
+        )
+        .await;
+        let mcp = PhronaMcp {
+            client: Arc::new(SearchClient::new().unwrap()),
+            max_results_limit: 100,
+        };
+        let mcp: serde_json::Value =
+            serde_json::from_str(&mcp.web_search(Parameters(params)).await).unwrap();
+
+        assert_eq!(rest_status, StatusCode::BAD_REQUEST);
+        let expected = serde_json::json!({
+            "error": "invalid source policy: unknown source policy mode: invalid-mode"
+        });
+        assert_eq!(rest, expected, "REST error payload changed: {rest}");
+        assert_eq!(
+            mcp,
+            serde_json::json!({
+                "query": "offline parity",
+                "total": 0,
+                "results": [],
+                "error": "invalid source policy: unknown source policy mode: invalid-mode"
+            }),
+            "MCP error payload changed"
+        );
+        assert_eq!(rest["error"], mcp["error"]);
     }
 }

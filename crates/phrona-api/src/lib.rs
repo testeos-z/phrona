@@ -38,7 +38,7 @@ use tower_http::trace::TraceLayer;
 use phrona::engine;
 use phrona::error::{ErrorKind as PhronaErrorKind, ErrorScope};
 use phrona::models::{Category, SearchResponse, TimeRange};
-use phrona::{PhronaConfig, SearchClient, SearchOptions, suggest, suggest_all};
+use phrona::{PhronaConfig, SearchClient, SearchOptions, SourcePolicy, suggest, suggest_all};
 
 /// Fixed-window rate-limit bucket for one client.
 struct RateWindow {
@@ -139,8 +139,10 @@ impl AppState {
 /// An API error with a JSON-friendly representation: bad request,
 /// unauthorized, rate limited, body too large, or an internal [`phrona`]
 /// failure.
+#[derive(Debug)]
 pub struct AppError(ErrorKind);
 
+#[derive(Debug)]
 enum ErrorKind {
     BadRequest(String),
     Unauthorized,
@@ -171,16 +173,20 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, body) = match self.0 {
-            ErrorKind::BadRequest(msg) => (StatusCode::BAD_REQUEST, json!({"error": msg})),
+        let (status, body, retry_after) = match self.0 {
+            ErrorKind::BadRequest(msg) => (StatusCode::BAD_REQUEST, json!({"error": msg}), None),
             ErrorKind::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 json!({"error": "invalid api key"}),
+                None,
             ),
-            ErrorKind::RateLimited(msg) => (StatusCode::TOO_MANY_REQUESTS, json!({"error": msg})),
+            ErrorKind::RateLimited(msg) => {
+                (StatusCode::TOO_MANY_REQUESTS, json!({"error": msg}), None)
+            }
             ErrorKind::BodyTooLarge(max) => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 json!({"error": format!("request body exceeds the {max}-byte limit")}),
+                None,
             ),
             ErrorKind::Internal(e) => {
                 tracing::error!("search failed: {e}");
@@ -194,10 +200,22 @@ impl IntoResponse for AppError {
                         ErrorScope::Egress | ErrorScope::Schema => StatusCode::BAD_GATEWAY,
                     }
                 };
-                (status, json!({"error": e.to_string()}))
+                let retry_after = match e.kind() {
+                    PhronaErrorKind::RateLimited {
+                        retry_after: Some(delay),
+                    } => Some(delay.as_secs().to_string()),
+                    _ => None,
+                };
+                (status, json!({"error": e.to_string()}), retry_after)
             }
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(value) = retry_after {
+            if let Ok(value) = value.parse() {
+                response.headers_mut().insert("retry-after", value);
+            }
+        }
+        response
     }
 }
 
@@ -283,6 +301,48 @@ struct SearchParams {
     language: Option<String>,
     time_range: Option<String>,
     filters: Option<String>,
+    source_policy_mode: Option<String>,
+    allowed_domains: Option<String>,
+    excluded_domains: Option<String>,
+}
+
+/// Additive policy object shared by JSON adapters (Tavily and MCP).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SourcePolicyParams {
+    /// Admission mode; omitted means `any`.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Caller-requested domains.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Caller-excluded domains.
+    #[serde(default)]
+    pub excluded_domains: Vec<String>,
+}
+
+pub(crate) fn compile_source_policy<IA, ID, A, D>(
+    mode: Option<&str>,
+    allowed: IA,
+    denied: ID,
+) -> AppResult<SourcePolicy>
+where
+    IA: IntoIterator<Item = A>,
+    ID: IntoIterator<Item = D>,
+    A: AsRef<str>,
+    D: AsRef<str>,
+{
+    SourcePolicy::compile(mode.unwrap_or("any"), allowed, denied)
+        .map_err(|e| AppError::bad_request(format!("invalid source policy: {e}")))
+}
+
+pub(crate) fn split_domains(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|domain| !domain.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn build_options(p: &SearchParams, max_results_limit: usize) -> AppResult<SearchOptions> {
@@ -328,6 +388,11 @@ fn build_options(p: &SearchParams, max_results_limit: usize) -> AppResult<Search
     opts.region = p.region.clone();
     opts.language = p.language.clone();
     opts.filters = p.filters.clone();
+    opts.source_policy = compile_source_policy(
+        p.source_policy_mode.as_deref(),
+        split_domains(p.allowed_domains.as_deref()),
+        split_domains(p.excluded_domains.as_deref()),
+    )?;
     Ok(opts)
 }
 
@@ -545,14 +610,24 @@ pub fn router(cfg: PhronaConfig) -> Router {
         .search_client()
         .expect("build search client")
         .with_observer(Arc::new(metrics::EngineMetricsObserver));
-    let state = Arc::new(AppState::new(
+    router_with_state(AppState::new(
         client,
         cfg.server.api_key.clone(),
         cfg.max_results_limit(),
         cfg.server.rate_limit_per_minute,
         cfg.server.max_body_bytes,
         cfg.server.trusted_proxies.clone(),
-    ));
+    ))
+}
+
+/// Build the same REST router from caller-supplied state.
+///
+/// This additive constructor is useful for deterministic integration tests
+/// that inject a configured [`phrona::SearchClient`]; route handlers,
+/// middleware and response shapes are identical to [`router`].
+pub fn router_with_state(state: AppState) -> Router {
+    let max_body_bytes = state.max_body_bytes;
+    let state = Arc::new(state);
 
     let protected = Router::new()
         .route("/v1/search", get(search_route))
@@ -580,7 +655,7 @@ pub fn router(cfg: PhronaConfig) -> Router {
                 )
                 .fallback(frontend::index),
         )
-        .layer(DefaultBodyLimit::max(cfg.server.max_body_bytes as usize))
+        .layer(DefaultBodyLimit::max(max_body_bytes as usize))
         .layer(middleware::from_fn(metrics::http_layer))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -671,6 +746,17 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["error"], "bad input");
+    }
+
+    #[test]
+    fn rate_limit_error_exposes_safe_retry_after_header() {
+        let response = AppError::from(phrona::Error::rate_limited(
+            "orchestrator",
+            Some(std::time::Duration::from_secs(30)),
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "30");
     }
 
     #[test]
@@ -930,6 +1016,61 @@ mod tests {
         assert_eq!(
             router.clone().oneshot(req(4243)).await.unwrap().status(),
             StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn source_policy_query_fields_compile_to_core_policy() {
+        let params = SearchParams {
+            q: "rust".into(),
+            category: None,
+            engines: None,
+            page: None,
+            max_results: None,
+            safesearch: None,
+            region: None,
+            language: None,
+            time_range: None,
+            filters: None,
+            source_policy_mode: Some("require-allowed".into()),
+            allowed_domains: Some("Docs.Example.com,unknown.example".into()),
+            excluded_domains: Some("private.example".into()),
+        };
+        let options = build_options(&params, 100).unwrap();
+        assert_eq!(
+            options.source_policy.mode(),
+            phrona::SourceMode::RequireAllowed
+        );
+        assert_eq!(
+            options.source_policy.allowed()[0].as_str(),
+            "docs.example.com"
+        );
+        assert_eq!(
+            options.source_policy.denied()[0].as_str(),
+            "private.example"
+        );
+    }
+
+    #[test]
+    fn omitted_source_policy_preserves_any_mode() {
+        let params = SearchParams {
+            q: "rust".into(),
+            category: None,
+            engines: None,
+            page: None,
+            max_results: None,
+            safesearch: None,
+            region: None,
+            language: None,
+            time_range: None,
+            filters: None,
+            source_policy_mode: None,
+            allowed_domains: None,
+            excluded_domains: None,
+        };
+        assert_eq!(
+            build_options(&params, 100).unwrap().source_policy.mode(),
+            phrona::SourceMode::Any
         );
     }
 }

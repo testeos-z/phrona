@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::models::{Category, SafeSearch, TimeRange};
+use crate::source_policy::SourcePolicy;
 
 /// Search parameters shared by every engine.
 #[derive(Debug, Clone)]
@@ -36,6 +37,9 @@ pub struct SearchOptions {
     /// Overall search deadline (the streaming orchestrator cancels
     /// in-flight engines past this point).
     pub timeout: Duration,
+    /// Local source eligibility and caller-requested scope. Defaults to the
+    /// compatibility-preserving `any` mode.
+    pub source_policy: SourcePolicy,
 }
 
 impl Default for SearchOptions {
@@ -53,6 +57,7 @@ impl Default for SearchOptions {
             filters: None,
             probe_all: false,
             timeout: Duration::from_secs(10),
+            source_policy: SourcePolicy::default(),
         }
     }
 }
@@ -104,6 +109,7 @@ impl SearchOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source_policy::SourceMode;
 
     #[test]
     fn enums_parse_from_str() {
@@ -146,6 +152,7 @@ mod tests {
         assert_eq!(o.max_results, 20);
         assert_eq!(o.safesearch, SafeSearch::Moderate);
         assert_eq!(o.engines, Vec::<String>::new());
+        assert_eq!(o.source_policy.mode(), SourceMode::Any);
     }
 
     #[test]

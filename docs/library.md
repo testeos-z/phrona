@@ -43,6 +43,7 @@ pub struct SearchOptions {
     pub language: Option<String>,    // e.g. "en"
     pub time_range: Option<TimeRange>, // Day | Week | Month | Year
     pub filters: Option<String>,     // engine-specific filter string
+    pub source_policy: SourcePolicy, // local eligibility; default any
 }
 ```
 
@@ -91,6 +92,12 @@ pub struct SearchResponse {
 - `Video`: title, url, description, duration, published, uploader, views, thumbnail_url
 - `Book`: title, author, publisher, info, url, thumbnail_url
 
+Every result additionally reports `source_policy_mode`, `requested_match`,
+`source_tier` and `policy_reason`. `SourcePolicy` is local and immutable:
+caller domains constrain scope only, while the configured operator catalogue
+assigns authority. `prefer-official` changes ordering, strict modes may return
+fewer results, and omitted policy preserves `any` compatibility.
+
 Convenience helpers: `phrona::search(opts).await`, `phrona::search_sync(opts)`.
 
 `EngineReport { name, status, results, error, scope, kind }` reports what
@@ -117,6 +124,11 @@ use phrona::{extract, ExtractedPage};
 let page: ExtractedPage = extract(&client.http(), "https://doc.rust-lang.org/book/", 8000, None).await?;
 // page.title, page.description, page.text, page.images
 ```
+
+For guarded extraction with a request policy, use
+`extract_with_policy(&client.http(), &policy, client.source_catalogue(), ...)`.
+The source policy is checked before the existing TargetPolicy/SSRF checks and
+again on every redirect; it never relaxes those controls.
 
 `extract_from_html` is the pure HTML variant. Pass a `query` to bias the
 excerpt selection toward the relevant fragment.

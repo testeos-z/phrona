@@ -1,4 +1,6 @@
-use phrona::{Category, EngineReport, ResultItem, SearchResponse};
+use phrona::{
+    Category, EngineReport, PolicyReason, ResultItem, SearchResponse, SourceMode, SourceTier,
+};
 
 /// Print one result line: ` 3. [web   ] Title` plus the URL and optional
 /// metadata indented below.
@@ -54,26 +56,50 @@ pub fn print_response(r: &SearchResponse) {
 /// metadata.
 pub fn print_item(position: usize, item: &ResultItem) {
     match item {
-        ResultItem::Web(w) => result_line("web", position, &w.title, &w.url, &w.description),
+        ResultItem::Web(w) => result_line(
+            "web",
+            position,
+            &w.title,
+            &w.url,
+            &with_policy(
+                &w.description,
+                w.source_policy_mode,
+                w.requested_match,
+                w.source_tier,
+                w.policy_reason,
+            ),
+        ),
         ResultItem::Image(i) => result_line(
             "image",
             position,
             &i.title,
             &i.url,
-            &format!("{} ({}x{})", i.image_url, i.width, i.height),
+            &with_policy(
+                &format!("{} ({}x{})", i.image_url, i.width, i.height),
+                i.source_policy_mode,
+                i.requested_match,
+                i.source_tier,
+                i.policy_reason,
+            ),
         ),
         ResultItem::News(n) => result_line(
             "news",
             position,
             &n.title,
             &n.url,
-            &format!(
-                "{}{}",
-                n.source,
-                n.published
-                    .as_deref()
-                    .map(|p| format!(" - {p}"))
-                    .unwrap_or_default()
+            &with_policy(
+                &format!(
+                    "{}{}",
+                    n.source,
+                    n.published
+                        .as_deref()
+                        .map(|p| format!(" - {p}"))
+                        .unwrap_or_default()
+                ),
+                n.source_policy_mode,
+                n.requested_match,
+                n.source_tier,
+                n.policy_reason,
             ),
         ),
         ResultItem::Video(v) => result_line(
@@ -81,15 +107,21 @@ pub fn print_item(position: usize, item: &ResultItem) {
             position,
             &v.title,
             &v.url,
-            &format!(
-                "{} | {} views | {}{}",
-                v.uploader,
-                v.views,
-                v.duration,
-                v.published
-                    .as_deref()
-                    .map(|p| format!(" | {p}"))
-                    .unwrap_or_default()
+            &with_policy(
+                &format!(
+                    "{} | {} views | {}{}",
+                    v.uploader,
+                    v.views,
+                    v.duration,
+                    v.published
+                        .as_deref()
+                        .map(|p| format!(" | {p}"))
+                        .unwrap_or_default()
+                ),
+                v.source_policy_mode,
+                v.requested_match,
+                v.source_tier,
+                v.policy_reason,
             ),
         ),
         ResultItem::Book(b) => result_line(
@@ -97,9 +129,27 @@ pub fn print_item(position: usize, item: &ResultItem) {
             position,
             &b.title,
             &b.url,
-            &format!("{} | {}{}", b.author, b.publisher, b.info),
+            &with_policy(
+                &format!("{} | {}{}", b.author, b.publisher, b.info),
+                b.source_policy_mode,
+                b.requested_match,
+                b.source_tier,
+                b.policy_reason,
+            ),
         ),
     }
+}
+
+fn with_policy(
+    detail: &str,
+    mode: SourceMode,
+    requested_match: bool,
+    tier: SourceTier,
+    reason: PolicyReason,
+) -> String {
+    format!(
+        "{detail} | source_policy={mode} requested_match={requested_match} source_tier={tier:?} policy_reason={reason:?}"
+    )
 }
 
 /// Print the list of registered engines for a category (`phrona engines`).

@@ -12,6 +12,7 @@ use url::Url;
 use crate::client::HttpClient;
 use crate::error::{Error, Result};
 use crate::parse;
+use crate::source_policy::{SourceAssessment, SourceCatalogue, SourcePolicy};
 
 /// Reject addresses that are never safe to fetch from the internet:
 /// loopback, RFC1918 private / IPv6 ULA, CGNAT, link-local (incl. cloud
@@ -142,8 +143,26 @@ pub async fn extract(
     max_chars: usize,
     query: Option<&str>,
 ) -> Result<ExtractedPage> {
+    let policy = SourcePolicy::default();
+    let catalogue = SourceCatalogue::default();
+    extract_with_policy(client, &policy, &catalogue, url, max_chars, query).await
+}
+
+/// Fetch and extract a page while enforcing a caller source policy and the
+/// operator-owned catalogue at the initial URL and every redirect hop.
+/// Source eligibility is checked before the unchanged TargetPolicy, DNS and
+/// private-IP safeguards, so a rejected source never causes outbound work.
+pub async fn extract_with_policy(
+    client: &HttpClient,
+    source_policy: &SourcePolicy,
+    source_catalogue: &SourceCatalogue,
+    url: &str,
+    max_chars: usize,
+    query: Option<&str>,
+) -> Result<ExtractedPage> {
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
+        source_target_assessment(&current, source_policy, source_catalogue)?;
         let parsed =
             Url::parse(&current).map_err(|_| Error::invalid_query("extract", "invalid URL"))?;
         if parsed.scheme() != "http" && parsed.scheme() != "https" {
@@ -168,9 +187,20 @@ pub async fn extract(
             url::Host::Ipv4(v4) => is_safe_ip(IpAddr::V4(v4)),
             url::Host::Ipv6(v6) => is_safe_ip(IpAddr::V6(v6)),
             url::Host::Domain(name) => {
+                #[cfg(test)]
+                if let Some(safe_ip) = client.test_safe_ip(name) {
+                    is_safe_ip(safe_ip)
+                } else {
+                    let addrs = tokio::net::lookup_host((name, port))
+                        .await
+                        .map_err(|_| Error::invalid_query("extract", "host resolution failed"))?;
+                    addrs.into_iter().all(|sa| is_safe_ip(sa.ip()))
+                }
+                #[cfg(not(test))]
                 let addrs = tokio::net::lookup_host((name, port))
                     .await
                     .map_err(|_| Error::invalid_query("extract", "host resolution failed"))?;
+                #[cfg(not(test))]
                 addrs.into_iter().all(|sa| is_safe_ip(sa.ip()))
             }
         };
@@ -210,6 +240,31 @@ pub async fn extract(
         return Ok(extract_from_html(&html, &current, max_chars, query));
     }
     Err(Error::internal("extract", "too many redirects"))
+}
+
+/// Pure source-policy guard shared by the initial URL and redirect hops.
+/// Keeping this separate makes the ordering/security contract testable without
+/// making a network request.
+fn source_target_assessment(
+    url: &str,
+    source_policy: &SourcePolicy,
+    source_catalogue: &SourceCatalogue,
+) -> Result<SourceAssessment> {
+    let assessment = source_policy
+        .assessment_for_url(url, source_catalogue)
+        .map_err(|_| Error::invalid_query("extract", "source URL is invalid"))?;
+    if !assessment.allowed() {
+        return Err(Error::invalid_query(
+            "extract",
+            "source URL is blocked by source policy",
+        ));
+    }
+    Ok(assessment)
+}
+
+#[cfg(test)]
+fn source_target_allowed(url: &str, policy: &SourcePolicy, catalogue: &SourceCatalogue) -> bool {
+    source_target_assessment(url, policy, catalogue).is_ok()
 }
 
 fn is_redirect_status(status: wreq::StatusCode) -> bool {
@@ -339,10 +394,150 @@ pub async fn extract_many(
     out
 }
 
+/// Extract several pages in parallel with one source policy and catalogue.
+/// Results remain in input order and use the same bounded concurrency as
+/// [`extract_many`].
+pub async fn extract_many_with_policy(
+    client: &HttpClient,
+    source_policy: &SourcePolicy,
+    source_catalogue: &SourceCatalogue,
+    urls: &[String],
+    max_chars: usize,
+    query: Option<&str>,
+) -> Vec<Result<ExtractedPage>> {
+    const CONCURRENCY: usize = 16;
+    let mut out = Vec::with_capacity(urls.len());
+    for chunk in urls.chunks(CONCURRENCY) {
+        let batch = chunk.iter().map(|url| {
+            extract_with_policy(
+                client,
+                source_policy,
+                source_catalogue,
+                url,
+                max_chars,
+                query,
+            )
+        });
+        out.extend(futures::future::join_all(batch).await);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
     use super::*;
     use crate::error::ErrorKind;
+
+    async fn redirect_spy(
+        listener: tokio::net::TcpListener,
+        location: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let Ok(Ok((mut socket, _))) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await
+        else {
+            return;
+        };
+        let mut buffer = [0u8; 4096];
+        let Ok(Ok(size)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), socket.read(&mut buffer)).await
+        else {
+            return;
+        };
+        requests
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(&buffer[..size]).into_owned());
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+    }
+
+    async fn proxy_spy(listener: tokio::net::TcpListener, requests: Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let Ok(Ok((mut socket, _))) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await
+        else {
+            return;
+        };
+        let mut buffer = [0u8; 4096];
+        let Ok(Ok(size)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), socket.read(&mut buffer)).await
+        else {
+            return;
+        };
+        requests
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(&buffer[..size]).into_owned());
+        let response =
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = socket.write_all(response).await;
+    }
+
+    struct ProxyEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        values: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ProxyEnvGuard {
+        fn force_proxy(proxy_url: &str) -> Self {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+            let names = [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ];
+            let values = names
+                .into_iter()
+                .map(|name| {
+                    let previous = std::env::var_os(name);
+                    // SAFETY: tests serialize proxy environment changes with LOCK and
+                    // restore every touched variable when the guard is dropped.
+                    unsafe {
+                        if name == "NO_PROXY" || name == "no_proxy" {
+                            std::env::remove_var(name);
+                        } else {
+                            std::env::set_var(name, proxy_url);
+                        }
+                    }
+                    (name, previous)
+                })
+                .collect();
+            Self {
+                _lock: lock,
+                values,
+            }
+        }
+    }
+
+    impl Drop for ProxyEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.values {
+                // SAFETY: the guard owns the serialized environment mutation and
+                // restores the value captured before the test.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
 
     const HTML: &str = r#"
 <!doctype html><html><head>
@@ -490,6 +685,209 @@ mod tests {
                 matches!(err.kind(), ErrorKind::InvalidQuery { .. }),
                 "{url}: {err}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_with_policy_rejects_excluded_initial_target_before_network() {
+        let client = HttpClient::builder().build().unwrap();
+        let policy = crate::source_policy::SourcePolicy::compile(
+            "any",
+            std::iter::empty::<&str>(),
+            ["blocked.example"],
+        )
+        .unwrap();
+        let err = extract_with_policy(
+            &client,
+            &policy,
+            &crate::source_policy::SourceCatalogue::default(),
+            "https://blocked.example/page",
+            100,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("source policy"));
+    }
+
+    #[test]
+    fn source_policy_is_rechecked_for_redirect_destinations() {
+        let policy = crate::source_policy::SourcePolicy::compile(
+            "any",
+            std::iter::empty::<&str>(),
+            ["blocked.example"],
+        )
+        .unwrap();
+        let catalogue = crate::source_policy::SourceCatalogue::default();
+
+        // The same pure guard is used immediately before the initial request
+        // and before every manually-followed redirect.
+        assert!(source_target_allowed(
+            "https://public.example/page",
+            &policy,
+            &catalogue
+        ));
+        assert!(!source_target_allowed(
+            "https://blocked.example/page",
+            &policy,
+            &catalogue
+        ));
+        // Source policy does not replace SSRF: an IP literal is source-policy
+        // eligible in `any`, then the existing private-IP guard rejects it.
+        assert!(source_target_allowed(
+            "http://127.0.0.1/private",
+            &policy,
+            &catalogue
+        ));
+        assert!(!is_safe_ip("127.0.0.1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn fetch_spy_rejects_excluded_redirect_before_next_hop() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let proxy_url = format!("http://{}", proxy_listener.local_addr().unwrap());
+        let proxy_requests = Arc::new(Mutex::new(Vec::new()));
+        let proxy = tokio::spawn(proxy_spy(proxy_listener, Arc::clone(&proxy_requests)));
+        let _proxy_env = ProxyEnvGuard::force_proxy(&proxy_url);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let excluded_url = format!("http://excluded.example.test:{port}/blocked");
+        let spy = tokio::spawn(redirect_spy(
+            listener,
+            excluded_url.clone(),
+            Arc::clone(&requests),
+        ));
+
+        let client = HttpClient::builder()
+            .resolve_for_test(
+                "allowed.example.test",
+                (Ipv4Addr::LOCALHOST, port).into(),
+                "93.184.216.34".parse::<IpAddr>().unwrap(),
+            )
+            .resolve_for_test(
+                "excluded.example.test",
+                (Ipv4Addr::LOCALHOST, port).into(),
+                "93.184.216.34".parse::<IpAddr>().unwrap(),
+            )
+            .build()
+            .unwrap();
+        let policy = crate::source_policy::SourcePolicy::compile(
+            "any",
+            std::iter::empty::<&str>(),
+            ["excluded.example.test"],
+        )
+        .unwrap();
+
+        let result = extract_with_policy(
+            &client,
+            &policy,
+            &crate::source_policy::SourceCatalogue::default(),
+            &format!("http://allowed.example.test:{port}/start"),
+            100,
+            None,
+        )
+        .await;
+
+        spy.await.unwrap();
+        let requests = requests.lock().unwrap().clone();
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("source policy")),
+            "expected source-policy rejection, got {result:?}"
+        );
+        assert_eq!(requests.len(), 1, "recorded requests: {requests:?}");
+        assert!(
+            requests[0].contains("GET /start "),
+            "request: {}",
+            requests[0]
+        );
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains(&format!("host: allowed.example.test:{port}")),
+            "request: {}",
+            requests[0]
+        );
+        assert!(
+            requests.iter().all(|request| !request.contains("/blocked")),
+            "excluded redirect was requested: {requests:?}"
+        );
+        proxy.abort();
+        let _ = proxy.await;
+        let proxy_requests = proxy_requests.lock().unwrap().clone();
+        assert!(
+            proxy_requests.is_empty(),
+            "system proxy intercepted the loopback fixture: {:?}",
+            proxy_requests
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_spy_still_sees_no_request_for_target_policy_or_private_ip_denials() {
+        for (url, target_policy, expected_error, map_host) in [
+            (
+                "http://denied.example.test/target-policy".to_string(),
+                crate::client::TargetPolicy {
+                    allowed: Vec::new(),
+                    denied: vec!["denied.example.test".into()],
+                },
+                "domain allow/deny policy",
+                Some("denied.example.test"),
+            ),
+            (
+                "http://127.0.0.1/private".to_string(),
+                crate::client::TargetPolicy::default(),
+                "SSRF blocked",
+                None,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let spy = tokio::spawn(redirect_spy(
+                listener,
+                format!("http://unused.example.test:{port}/unused"),
+                Arc::clone(&requests),
+            ));
+            let mut builder = HttpClient::builder().target_policy(target_policy);
+            if let Some(host) = map_host {
+                builder = builder.resolve_for_test(
+                    host,
+                    (Ipv4Addr::LOCALHOST, port).into(),
+                    "93.184.216.34".parse::<IpAddr>().unwrap(),
+                );
+            }
+            let client = builder.build().unwrap();
+            let result = extract_with_policy(
+                &client,
+                &crate::source_policy::SourcePolicy::default(),
+                &crate::source_policy::SourceCatalogue::default(),
+                &url,
+                100,
+                None,
+            )
+            .await;
+
+            spy.abort();
+            let _ = spy.await;
+            let requests = requests.lock().unwrap();
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.to_string().contains(expected_error)),
+                "{url}: expected {expected_error}, got {result:?}"
+            );
+            assert!(requests.is_empty(), "{url} made requests: {requests:?}");
         }
     }
 }

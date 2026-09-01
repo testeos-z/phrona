@@ -81,6 +81,12 @@ const buildParams = () => {
   if (tr) p.set("time_range", tr);
   const ss = $("safesearch").value;
   if (ss) p.set("safesearch", ss);
+  const mode = $("source-policy-mode").value;
+  if (mode && mode !== "any") p.set("source_policy_mode", mode);
+  for (const [id, key] of [["allowed-domains", "allowed_domains"], ["excluded-domains", "excluded_domains"]]) {
+    const v = $(id).value.trim();
+    if (v) p.set(key, v);
+  }
   return p;
 };
 
@@ -107,6 +113,10 @@ const restoreLocation = () => {
   if (tr) $("time-range").value = tr;
   const ss = p.get("safesearch");
   if (ss) $("safesearch").value = ss;
+  if (p.get("source_policy_mode")) $("source-policy-mode").value = p.get("source_policy_mode");
+  for (const [id, key] of [["allowed-domains", "allowed_domains"], ["excluded-domains", "excluded_domains"]]) {
+    if (p.get(key)) $(id).value = p.get(key);
+  }
   if (p.get("engines")) state.engines = new Set(p.get("engines").split(",").filter(Boolean));
   renderEngines();
   return true;
@@ -284,6 +294,7 @@ function card(r) {
     r.duration && `<span>${esc(r.duration)}</span>`,
     r.views && `<span>${Number(r.views).toLocaleString()} views</span>`,
     r.uploader && `<span>${esc(r.uploader)}</span>`,
+    r.source_tier && `<span>source: ${esc(r.source_tier)}${r.requested_match ? " · requested" : ""}</span>`,
   ].filter(Boolean).join("");
   const thumb = state.category === "videos" && r.thumbnail_url
     ? `<div class="vid-thumb"><img loading="lazy" src="${esc(sanitizeUrl(r.thumbnail_url))}" alt=""><span class="vid-dur">${esc(r.duration || "")}</span></div>`
@@ -332,6 +343,7 @@ const TOOLS = {
     params: (f) => {
       const p = new URLSearchParams({ url: f("url"), max_chars: f("max_chars") || "5000" });
       if (f("query")) p.set("query", f("query"));
+      addSourcePolicy(p, f);
       return p;
     },
     render: (el, d) => {
@@ -346,6 +358,7 @@ const TOOLS = {
     params: (f) => {
       const p = new URLSearchParams({ query: f("query"), max_results: f("max_results") || "8" });
       for (const k of ["category", "time_range"]) if (f(k)) p.set(k, f(k));
+      addSourcePolicy(p, f);
       return p;
     },
     render: (el, d) => {
@@ -353,7 +366,7 @@ const TOOLS = {
         (d.sources || []).map((s) =>
           `<article class="card"><h3><a href="${esc(sanitizeUrl(s.url))}" target="_blank" rel="noopener noreferrer">${esc(s.title)}</a></h3>
            <div class="url">${esc(s.url)}</div><p class="desc">${esc(s.content)}</p>
-           <div class="sub"><span>score ${esc(String(s.score))}</span></div></article>`).join("");
+           <div class="sub"><span>score ${esc(String(s.score))}</span><span>source: ${esc(s.source_tier || "unknown")}${s.requested_match ? " · requested" : ""}</span></div></article>`).join("");
     },
   },
   engines: {
@@ -384,6 +397,15 @@ const TOOLS = {
     },
   },
 };
+
+function addSourcePolicy(p, field) {
+  if (field("source_policy_mode") && field("source_policy_mode") !== "any") {
+    p.set("source_policy_mode", field("source_policy_mode"));
+  }
+  for (const key of ["allowed_domains", "excluded_domains"]) {
+    if (field(key)) p.set(key, field(key));
+  }
+}
 
 qsa("form.tool-form").forEach((form) => {
   form.addEventListener("submit", async (e) => {

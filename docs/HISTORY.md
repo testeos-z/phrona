@@ -13,6 +13,17 @@
 
 # HISTORY
 
+## (2026-08-31) local source policy parity
+
+- REST/Tavily, MCP, CLI, Python and the frontend now accept the additive source
+  policy contract. Tavily legacy include/exclude domains are enforced locally,
+  not only emitted as provider hints.
+- Result metadata separates caller `requested_match` from operator-catalogued
+  `source_tier`; caller domains cannot confer authority. Configured catalogues
+  are shared with guarded extraction and every redirect retains SSRF checks.
+- Omitted policy remains `any`; strict policies may be sparse and add no DNS,
+  reputation, retry, wait or deadline work.
+
 A log of how Phrona was built, commit by commit.
 
 ## (2026-08-25) session hardening: opt-in browser bootstrap, qwant pure-HTTP

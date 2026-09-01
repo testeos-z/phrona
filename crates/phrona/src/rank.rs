@@ -1,6 +1,7 @@
 //! Cross-engine ranking and scoring.
 
 use crate::dedup::GroupedResult;
+use crate::source_policy::{SourceMode, SourceTier};
 
 /// Split a query into the alphanumeric terms used for matching, using the
 /// exact same tokenizer as document titles and bodies. Matching the
@@ -41,14 +42,48 @@ fn raw_score(g: &GroupedResult, terms: &[String]) -> f64 {
 /// be turned into the display score with [`normalize_score`] without
 /// recomputing it.
 pub fn rank(groups: Vec<GroupedResult>, query: &str) -> Vec<(f64, GroupedResult)> {
+    rank_with_policy(groups, query, SourceMode::Any)
+}
+
+/// Rank grouped results using the selected source-policy ordering. Authority
+/// is a bounded ordering key, never a numeric relevance bonus: `any` keeps
+/// relevance first and uses authority only for equal scores, while
+/// `prefer-official` puts official and secondary sources before relevance.
+pub fn rank_with_policy(
+    groups: Vec<GroupedResult>,
+    query: &str,
+    mode: SourceMode,
+) -> Vec<(f64, GroupedResult)> {
     let terms = query_terms(query);
     let mut scored: Vec<(f64, GroupedResult)> = groups
         .into_iter()
         .map(|g| (raw_score(&g, &terms), g))
         .collect();
 
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        let authority = || {
+            authority_rank_key(a.1.result.source_assessment.unwrap_or_default().source_tier).cmp(
+                &authority_rank_key(b.1.result.source_assessment.unwrap_or_default().source_tier),
+            )
+        };
+        let relevance = || b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal);
+        match mode {
+            SourceMode::PreferOfficial => authority().reverse().then_with(relevance),
+            SourceMode::Any | SourceMode::RequireAllowed | SourceMode::OfficialOnly => {
+                relevance().then_with(|| authority().reverse())
+            }
+        }
+    });
     scored
+}
+
+/// Bounded authority key used only for deterministic policy-aware ordering.
+pub const fn authority_rank_key(tier: SourceTier) -> u8 {
+    match tier {
+        SourceTier::Official => 2,
+        SourceTier::Secondary => 1,
+        SourceTier::Unknown => 0,
+    }
 }
 
 /// Normalize an already-computed raw score into the display score bounded
@@ -112,6 +147,7 @@ mod tests {
     use super::*;
     use crate::dedup::GroupedResult;
     use crate::models::RawResult;
+    use crate::source_policy::SourceMode;
 
     fn group(title: &str, url: &str, desc: &str, engine: &str, position: u32) -> GroupedResult {
         GroupedResult {
@@ -283,6 +319,71 @@ mod tests {
         assert_eq!(positional_score(4), 0.8);
         assert_eq!(positional_score(19), 0.05);
         assert_eq!(positional_score(100), 0.05);
+    }
+
+    #[test]
+    fn authority_rank_key_is_bounded_and_ordered() {
+        assert!(
+            authority_rank_key(SourceTier::Official) > authority_rank_key(SourceTier::Secondary)
+        );
+        assert!(
+            authority_rank_key(SourceTier::Secondary) > authority_rank_key(SourceTier::Unknown)
+        );
+        assert_eq!(authority_rank_key(SourceTier::Official), 2);
+        assert_eq!(authority_rank_key(SourceTier::Unknown), 0);
+    }
+
+    #[test]
+    fn policy_ranking_prefers_authority_before_relevance_when_requested() {
+        let mut official = group("unrelated", "https://official.example/a", "", "bing", 10);
+        official.result.source_assessment = Some(crate::source_policy::SourceAssessment {
+            requested_match: false,
+            source_tier: SourceTier::Official,
+            reason: crate::source_policy::PolicyReason::Allowed,
+        });
+        let unknown = group("rust", "https://unknown.example/b", "rust", "bing", 1);
+
+        let ranked = rank_with_policy(vec![unknown, official], "rust", SourceMode::PreferOfficial);
+        assert_eq!(ranked[0].1.result.url, "https://official.example/a");
+    }
+
+    #[test]
+    fn policy_ranking_keeps_relevance_and_uses_authority_only_as_tiebreaker() {
+        let mut official = group("rust", "https://official.example/a", "", "bing", 1);
+        official.result.source_assessment = Some(crate::source_policy::SourceAssessment {
+            requested_match: false,
+            source_tier: SourceTier::Official,
+            reason: crate::source_policy::PolicyReason::Allowed,
+        });
+        let mut unknown = group("rust", "https://unknown.example/b", "", "bing", 1);
+        unknown.result.source_assessment = Some(crate::source_policy::SourceAssessment {
+            requested_match: false,
+            source_tier: SourceTier::Unknown,
+            reason: crate::source_policy::PolicyReason::Allowed,
+        });
+
+        let ranked = rank_with_policy(vec![unknown, official.clone()], "rust", SourceMode::Any);
+        assert_eq!(ranked[0].1.result.url, "https://official.example/a");
+
+        let mut more_relevant_unknown = group(
+            "rust rust rust",
+            "https://unknown.example/c",
+            "rust rust",
+            "bing",
+            1,
+        );
+        more_relevant_unknown.result.source_assessment =
+            Some(crate::source_policy::SourceAssessment {
+                requested_match: false,
+                source_tier: SourceTier::Unknown,
+                reason: crate::source_policy::PolicyReason::Allowed,
+            });
+        let ranked = rank_with_policy(
+            vec![more_relevant_unknown, official],
+            "rust",
+            SourceMode::Any,
+        );
+        assert_eq!(ranked[0].1.result.url, "https://unknown.example/c");
     }
 
     #[test]

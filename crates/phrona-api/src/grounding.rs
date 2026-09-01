@@ -45,6 +45,15 @@ pub struct GroundingRequest {
     #[serde(default)]
     /// Optional engine-specific filter string.
     pub filters: Option<String>,
+    #[serde(default)]
+    /// Source-policy mode; omitted means `any`.
+    pub source_policy_mode: Option<String>,
+    #[serde(default)]
+    /// Caller-requested domain CSV.
+    pub allowed_domains: Option<String>,
+    #[serde(default)]
+    /// Caller-excluded domain CSV.
+    pub excluded_domains: Option<String>,
 }
 
 /// GET /v1/grounding?query=... - same feature; auth is header-only.
@@ -76,6 +85,15 @@ pub struct GroundingGetParams {
     #[serde(default)]
     /// Optional engine-specific filter string.
     pub filters: Option<String>,
+    #[serde(default)]
+    /// Source-policy mode; omitted means `any`.
+    pub source_policy_mode: Option<String>,
+    #[serde(default)]
+    /// Caller-requested domain CSV.
+    pub allowed_domains: Option<String>,
+    #[serde(default)]
+    /// Caller-excluded domain CSV.
+    pub excluded_domains: Option<String>,
 }
 
 /// The response to a grounding request: an extractive answer plus the
@@ -103,6 +121,14 @@ pub struct GroundingSource {
     pub content: String,
     /// Positional relevance score (1.0 down to 0.05).
     pub score: f64,
+    /// Source-policy mode used for this source.
+    pub source_policy_mode: phrona::SourceMode,
+    /// Whether the source matched the caller's requested scope.
+    pub requested_match: bool,
+    /// Operator-assigned authority tier.
+    pub source_tier: phrona::SourceTier,
+    /// Eligibility explanation.
+    pub policy_reason: phrona::PolicyReason,
 }
 
 /// Build an extractive answer from the top results. The library answer
@@ -173,6 +199,9 @@ struct GroundingParams {
     language: Option<String>,
     safesearch: Option<String>,
     filters: Option<String>,
+    source_policy_mode: Option<String>,
+    allowed_domains: Option<String>,
+    excluded_domains: Option<String>,
 }
 
 fn params_from_get(p: &GroundingGetParams) -> GroundingParams {
@@ -186,6 +215,9 @@ fn params_from_get(p: &GroundingGetParams) -> GroundingParams {
         language: p.language.clone(),
         safesearch: p.safesearch.clone(),
         filters: p.filters.clone(),
+        source_policy_mode: p.source_policy_mode.clone(),
+        allowed_domains: p.allowed_domains.clone(),
+        excluded_domains: p.excluded_domains.clone(),
     }
 }
 
@@ -200,6 +232,9 @@ fn params_from_post(p: &GroundingRequest) -> GroundingParams {
         language: p.language.clone(),
         safesearch: p.safesearch.clone(),
         filters: p.filters.clone(),
+        source_policy_mode: p.source_policy_mode.clone(),
+        allowed_domains: p.allowed_domains.clone(),
+        excluded_domains: p.excluded_domains.clone(),
     }
 }
 
@@ -241,6 +276,11 @@ async fn run(state: &AppState, p: &GroundingParams) -> AppResult<Json<GroundingR
         })?;
     }
     opts.filters = p.filters.clone().filter(|f| !f.trim().is_empty());
+    opts.source_policy = crate::compile_source_policy(
+        p.source_policy_mode.as_deref(),
+        crate::split_domains(p.allowed_domains.as_deref()),
+        crate::split_domains(p.excluded_domains.as_deref()),
+    )?;
 
     let started = std::time::Instant::now();
     let resp = state.client.search(opts).await?;
@@ -249,18 +289,63 @@ async fn run(state: &AppState, p: &GroundingParams) -> AppResult<Json<GroundingR
     let mut sources: Vec<GroundingSource> = Vec::new();
     for (i, r) in resp.results.iter().enumerate() {
         let score = phrona::rank::positional_score(i);
-        let (title, url, content) = match r {
-            phrona::ResultItem::Web(w) => (&w.title, &w.url, &w.description),
-            phrona::ResultItem::News(n) => (&n.title, &n.url, &n.description),
-            phrona::ResultItem::Video(v) => (&v.title, &v.url, &v.description),
-            phrona::ResultItem::Image(i) => (&i.title, &i.url, &i.source),
-            phrona::ResultItem::Book(b) => (&b.title, &b.url, &b.info),
-        };
+        let (title, url, content, source_policy_mode, requested_match, source_tier, policy_reason) =
+            match r {
+                phrona::ResultItem::Web(w) => (
+                    &w.title,
+                    &w.url,
+                    &w.description,
+                    w.source_policy_mode,
+                    w.requested_match,
+                    w.source_tier,
+                    w.policy_reason,
+                ),
+                phrona::ResultItem::News(n) => (
+                    &n.title,
+                    &n.url,
+                    &n.description,
+                    n.source_policy_mode,
+                    n.requested_match,
+                    n.source_tier,
+                    n.policy_reason,
+                ),
+                phrona::ResultItem::Video(v) => (
+                    &v.title,
+                    &v.url,
+                    &v.description,
+                    v.source_policy_mode,
+                    v.requested_match,
+                    v.source_tier,
+                    v.policy_reason,
+                ),
+                phrona::ResultItem::Image(i) => (
+                    &i.title,
+                    &i.url,
+                    &i.source,
+                    i.source_policy_mode,
+                    i.requested_match,
+                    i.source_tier,
+                    i.policy_reason,
+                ),
+                phrona::ResultItem::Book(b) => (
+                    &b.title,
+                    &b.url,
+                    &b.info,
+                    b.source_policy_mode,
+                    b.requested_match,
+                    b.source_tier,
+                    b.policy_reason,
+                ),
+            };
         sources.push(GroundingSource {
             title: title.clone(),
             url: url.clone(),
             content: content.clone(),
             score,
+            source_policy_mode,
+            requested_match,
+            source_tier,
+            policy_reason,
         });
     }
 

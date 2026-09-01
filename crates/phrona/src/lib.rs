@@ -56,15 +56,23 @@ pub mod options;
 pub mod parse;
 pub mod rank;
 pub mod search;
+pub mod source_policy;
 
 pub use client::{HttpClient, HttpClientBuilder, Profile, TargetPolicy};
-pub use config::{ConfigError, PhronaConfig};
+pub use config::{ConfigError, PhronaConfig, SourcesConfig};
 pub use error::{Error, Result};
-pub use extract::{ExtractedPage, extract, extract_from_html, extract_many, is_safe_ip};
+pub use extract::{
+    ExtractedPage, extract, extract_from_html, extract_many, extract_many_with_policy,
+    extract_with_policy, is_safe_ip,
+};
 pub use models::*;
 pub use options::SearchOptions;
 pub use search::{
     EngineObserver, NoopEngineObserver, SearchClient, available_engines, search, search_sync,
+};
+pub use source_policy::{
+    DomainSet, NormalizedDomain, PolicyReason, SourceAssessment, SourceCatalogue, SourceMode,
+    SourcePolicy, SourcePolicyError, SourceTier,
 };
 
 /// The crate version, read from `CARGO_PKG_VERSION`.

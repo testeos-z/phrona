@@ -29,7 +29,9 @@ phrona search "rust" --category images --safesearch strict --max-results 20
 
 Options: `--category web|images|news|videos|books`, `--engines <csv>`,
 `--max-results`, `--safesearch off|moderate|strict`, `--region`, `--language`,
-`--time-range day|week|month|year`, `--filters`, `--page`.
+`--time-range day|week|month|year`, `--filters`, `--page`,
+`--source-policy-mode any|prefer-official|require-allowed|official-only`,
+repeatable `--allowed-domain` and `--excluded-domain`.
 
 Text output shows the query summary, answer, suggestions, ranked results
 with engine provenance, and the per-engine report (status, result count,
@@ -45,7 +47,8 @@ phrona suggest rus --json                # all 7 sources
 ### phrona extract <url> [url...]
 
 One or more URLs, fetched and extracted in parallel. `--query` biases
-the excerpt; `--max-chars` caps the text.
+the excerpt; `--max-chars` caps the text. Extraction also accepts the source
+policy flags, which are checked on every redirect.
 
 ```bash
 phrona extract https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html \
@@ -59,7 +62,8 @@ Grounded output for RAG: the answer (library answer engine verbatim when
 present, otherwise an extractive summary) followed by ranked cited sources.
 Accepts the full search option set: `--category`, `--engines`,
 `--max-results`, `--region`, `--language`, `--time-range`, `--safesearch`,
-`--filters`, `--page`.
+`--filters`, `--page`, `--source-policy-mode`, `--allowed-domain`,
+`--excluded-domain`.
 
 ```bash
 phrona ground "rust ownership"

@@ -49,7 +49,8 @@ phrona.extract("https://example.com", max_chars=5000, query="hello")
 client = phrona.Client(profile="chrome", timeout=20)
 client.search("rust", category="web", engines=None, page=1, max_results=20,
               safesearch="moderate", region=None, language=None,
-              time_range=None, filters=None)
+               time_range=None, filters=None, source_policy_mode="any",
+               allowed_domains=None, excluded_domains=None)
 client.suggest("rus", source=None, region="us-en")
 # {'query': 'rus', 'suggestions': {'bing': [...], 'google': [...], ...}}
 client.extract("https://example.com", max_chars=8000, query=None)
@@ -60,7 +61,8 @@ All result values are plain Python dicts/lists/str/int/float - no wrapper
 objects, JSON-serializable by construction. `extract` uses manual
 serialization of `ExtractedPage` (pyo3 class specialization).
 
-`search` keyword arguments mirror `SearchOptions`; `engines=None` means all
+`search` keyword arguments mirror `SearchOptions`; source policy arguments use
+the same mode/domain semantics as REST and MCP. `engines=None` means all
 engines of the category. `profile` accepts "chrome", "firefox", "edge",
 "safari", "opera", "okhttp" (or a numeric profile). `timeout` is seconds.
 Invalid enum values (`safesearch`, `time_range`, `category`, `profile`)

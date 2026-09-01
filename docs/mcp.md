@@ -36,17 +36,25 @@ Nine tools, each with JSON Schema parameters (generated with schemars):
 
 | Tool | Description |
 | --- | --- |
-| `web_search` | search web results (query, page, max_results, safesearch, region, language, time_range, filters, engines) |
+| `web_search` | search web results (query, page, max_results, safesearch, region, language, time_range, filters, engines, source_policy) |
 | `image_search` | image results (query, max_results, safesearch, region, filters, engines) |
 | `news_search` | news results with date/source (query, max_results, region, time_range, engines) |
 | `video_search` | videos with duration/views/uploader (query, max_results, safesearch, region, engines) |
 | `book_search` | books with author/publisher (query, max_results, region, engines) |
 | `suggest` | query completions (query, source, region) |
-| `fetch_page` | extract a page: title, description, text (max_chars, query bias) |
-| `search_grounded` | RAG: search + pick best page + return verbatim excerpt and ranked sources |
+| `fetch_page` | extract a page: title, description, text (max_chars, query bias, source_policy) |
+| `search_grounded` | RAG: search + pick best page + return verbatim excerpt and ranked sources (same `source_policy` as search) |
 | `list_engines` | available engines per category (invalid categories return an error envelope) |
 
 Tool call results are `text/plain` content containing JSON.
+
+`source_policy` is optional and has the shared shape
+`{"mode":"any|prefer-official|require-allowed|official-only", "allowed_domains": [], "excluded_domains": []}`.
+It defaults to `any`. Results retain additive `source_policy_mode`,
+`requested_match`, `source_tier` and `policy_reason` metadata. The operator's
+configured catalogue is the only authority source; policy evaluation is local
+and adds no network lookups, waits or retries. Fetches enforce the policy on
+every redirect in addition to existing SSRF protections.
 
 ## search_grounded
 
